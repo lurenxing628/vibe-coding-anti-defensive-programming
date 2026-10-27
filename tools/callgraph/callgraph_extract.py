@@ -255,7 +255,7 @@ def _resolve_edges(all_funcs: Dict[str, FuncInfo], name_to_quals: Dict[str, List
             edges.append(_edge(str(info["parent"]), qual, "lambda_definition", False))
         bare, attr, dyn, module_attr = _callsites.collect_calls(info["node"])
         local_targets = _local_function_targets(file_funcs, info)
-        bound_vars = _tresolver.local_bound_names(info["node"]) - set(local_targets)
+        bound_vars = _tresolver.local_bound_names(info, all_funcs) - set(local_targets)
         references = (_tresolver.collect_value_references(info["node"]) - bare) - bound_vars
         dataflow = _flow.collect(info["node"])
         if any(dataflow.values()):
@@ -263,6 +263,7 @@ def _resolve_edges(all_funcs: Dict[str, FuncInfo], name_to_quals: Dict[str, List
         if dyn:
             dynamic_unresolved.append({"func": qual, "rel": info["rel"], "line": info["line"], "hints": sorted(dyn)})
         imports = dict(file_imports.get(info["rel"], {}))
+        imports.update(_tresolver.module_top_aliases(trees.get(info["rel"]), imports))
         imports.update(_findex.function_import_aliases(info["node"], info["rel"]))
         _add_bare_edges(edges, qual, bare, local_targets, name_to_quals, imports, all_funcs, bound_vars)
         _add_function_reference_edges(edges, qual, references, local_targets, imports, all_funcs)

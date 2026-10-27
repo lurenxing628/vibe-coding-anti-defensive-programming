@@ -39,7 +39,7 @@ BUILTIN_ANNOTATIONS = frozenset({
     "Callable", "Connection", "Cursor", "Logger", "TextIO", "BinaryIO", "IO",
 })
 CONTAINER_METHODS = frozenset({
-    "append", "extend", "insert", "pop", "remove", "clear", "copy", "sort", "reverse",
+    "append", "extend", "insert", "pop", "remove", "clear", "copy", "sort", "reverse", "index", "count",
     "get", "keys", "values", "items", "setdefault", "update", "popitem",
     "add", "discard", "union", "intersection", "difference",
     "strip", "lstrip", "rstrip", "split", "rsplit", "splitlines", "join",
@@ -119,8 +119,7 @@ def _is_property_node(fnode: ast.AST) -> bool:
     return False
 
 
-def local_bound_names(fnode: ast.AST) -> Set[str]:
-    """收集当前函数形参及局部赋值绑定名（不含内部 def/class 声明名），用于识别普通局部变量。"""
+def _node_bound_names(fnode: ast.AST) -> Set[str]:
     bound: Set[str] = set()
     if isinstance(fnode, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
         args = (
@@ -140,6 +139,37 @@ def local_bound_names(fnode: ast.AST) -> Set[str]:
         elif isinstance(sub, ast.ExceptHandler) and isinstance(sub.name, str):
             bound.add(sub.name)
     return bound
+
+
+def local_bound_names(
+    info: Dict[str, Any],
+    all_funcs: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Set[str]:
+    """收集当前函数及外层闭包祖先函数的形参与局部赋值绑定名。"""
+    fnode = info["node"] if isinstance(info, dict) else info
+    bound = _node_bound_names(fnode)
+    if isinstance(info, dict) and all_funcs:
+        parent_qual = info.get("parent")
+        while parent_qual and parent_qual in all_funcs:
+            pinfo = all_funcs[parent_qual]
+            bound.update(_node_bound_names(pinfo["node"]))
+            parent_qual = pinfo.get("parent")
+    return bound
+
+
+def module_top_aliases(tree: Optional[ast.Module], base_imports: Dict[str, str]) -> Dict[str, str]:
+    """提取模块顶层 ``alias = imported_mod.func`` 形式的导入别名。"""
+    if tree is None:
+        return {}
+    aliases: Dict[str, str] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Attribute) and isinstance(stmt.value.value, ast.Name):
+            mod = base_imports.get(stmt.value.value.id)
+            if mod:
+                for tgt in stmt.targets:
+                    if isinstance(tgt, ast.Name):
+                        aliases[tgt.id] = f"{mod}.{stmt.value.attr}"
+    return aliases
 
 
 def collect_value_references(fnode: ast.AST) -> Set[str]:
