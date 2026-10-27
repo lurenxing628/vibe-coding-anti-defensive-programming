@@ -2,8 +2,8 @@
 
 - Tier 1（默认开启，0 外部依赖，毫秒级）：
   利用类继承表、函数参数/返回值类型注解、类属性注解与 __init__ 赋值（self.x = Cls()）、
-  局部变量构造/注解/with 绑定，将 ``obj.method()`` 与 ``self.attr.method()`` 消解为
-  ``kind="typed", ambiguous=False`` 的确信边，同时剔除向全仓其他同名类乱连的假模糊边。
+  局部变量构造/注解/with 绑定及 @property 属性访问，将 ``obj.method()``、``self.attr.method()``
+  与 ``obj.prop`` 消解为 ``kind="typed", ambiguous=False`` 的确信边，同时剔除向全仓其他同名类乱连的假模糊边。
 - Tier 2（--mode deep 开启）：
   融合 SCIP 全量类型索引（index.scip）与 sys.setprofile 运行时真实调用边（runtime_edges.json），
   将命中的模糊边直接升级为 ``ambiguous=False`` 确信边，并补齐纯动态派发边。
@@ -15,7 +15,7 @@ import json
 import os
 import re
 from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import callgraph_call_sites as _callsites
 
@@ -28,38 +28,48 @@ BUILTIN_CONSTRUCTORS = frozenset({
     "int", "float", "bool", "defaultdict", "Counter", "deque", "OrderedDict",
     "Path", "PurePath", "PosixPath", "WindowsPath", "datetime", "date", "time", "timedelta",
     "re.compile", "io.StringIO", "io.BytesIO", "StringIO", "BytesIO",
+    "sqlite3.connect", "logging.getLogger", "getLogger",
 })
 BUILTIN_ANNOTATIONS = frozenset({
-    "list", "List", "Sequence", "MutableSequence", "Iterable", "Iterator",
+    "list", "List", "Sequence", "MutableSequence", "Iterable", "Iterator", "Collection",
     "dict", "Dict", "Mapping", "MutableMapping", "Counter", "defaultdict", "OrderedDict",
-    "set", "Set", "AbstractSet", "MutableSet", "frozenset", " FrozenSet",
+    "set", "Set", "AbstractSet", "MutableSet", "frozenset", "FrozenSet",
     "tuple", "Tuple", "str", "bytes", "bytearray", "int", "float", "bool",
     "Path", "PurePath", "datetime", "date", "time", "timedelta", "Pattern",
+    "Callable", "Connection", "Cursor", "Logger", "TextIO", "BinaryIO", "IO",
 })
 CONTAINER_METHODS = frozenset({
     "append", "extend", "insert", "pop", "remove", "clear", "copy", "sort", "reverse",
     "get", "keys", "values", "items", "setdefault", "update", "popitem",
     "add", "discard", "union", "intersection", "difference",
     "strip", "lstrip", "rstrip", "split", "rsplit", "splitlines", "join",
-    "replace", " lower", "upper", "startswith", "endswith", "find", "rfind",
+    "replace", "lower", "upper", "startswith", "endswith", "find", "rfind",
     "encode", "decode", "format", "isascii", "isdigit", "isdecimal", "isalnum", "isalpha",
     "exists", "is_file", "is_dir", "read_text", "write_text", "read_bytes", "write_bytes",
     "mkdir", "unlink", "resolve", "glob", "rglob", "with_name", "with_suffix",
     "isoformat", "fromisoformat", "total_seconds", "strftime", "strptime",
+    "close", "fetchone", "fetchall", "fetchmany", "commit", "rollback", "cursor",
+    "info", "debug", "warning", "error", "exception",
 })
+_WRAPPER_TYPES = ("Optional", "Union", "Annotated", "Final", "ClassVar")
 
 
 def _unwrap_annotation(node: Optional[ast.AST]) -> str:
-    """从类型注解 AST 中提取核心类名（剥离 Optional / Union / Annotated / 字符串引号）。"""
+    """从类型注解 AST 中提取核心类名或泛型容器名（剥离 Optional / Union / Annotated / 引号）。"""
     if node is None:
         return ""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         text = node.value.strip()
         if "[" in text:
             head, _, inner = text.partition("[")
-            if head.split(".")[-1] in ("Optional", "Union", "Annotated", "Final", "ClassVar"):
+            short_head = head.split(".")[-1].strip()
+            if short_head in _WRAPPER_TYPES:
                 first = inner.rstrip("]").split(",")[0].strip()
-                return first
+                return _unwrap_annotation(ast.Constant(value=first))
+            return short_head
+        if "|" in text:
+            parts = [p.strip() for p in text.split("|") if p.strip() and p.strip() != "None"]
+            return _unwrap_annotation(ast.Constant(value=parts[0])) if parts else ""
         return text
     if isinstance(node, ast.Name):
         return node.id
@@ -67,19 +77,122 @@ def _unwrap_annotation(node: Optional[ast.AST]) -> str:
         base = _unwrap_annotation(node.value)
         return f"{base}.{node.attr}" if base else node.attr
     if isinstance(node, ast.Subscript):
-        wrapper = _unwrap_annotation(node.value).split(".")[-1]
-        if wrapper in ("Optional", "Union", "Annotated", "Final", "ClassVar"):
+        wrapper = _unwrap_annotation(node.value)
+        short_wrapper = wrapper.split(".")[-1]
+        if short_wrapper in _WRAPPER_TYPES:
             slc = node.slice
+            if isinstance(slc, ast.Index):  # Py3.8 兼容
+                slc = slc.value  # type: ignore[attr-defined]
             if isinstance(slc, ast.Tuple) and slc.elts:
                 for elt in slc.elts:
                     name = _unwrap_annotation(elt)
                     if name and name != "None":
                         return name
             return _unwrap_annotation(slc)
+        return short_wrapper or wrapper
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
         left = _unwrap_annotation(node.left)
         return left if left and left != "None" else _unwrap_annotation(node.right)
     return ""
+
+
+def _extract_dataclass_default_factory(expr: Optional[ast.AST]) -> str:
+    """提取 ``field(default_factory=...)`` 中的工厂类名或构造器名。"""
+    if not isinstance(expr, ast.Call):
+        return ""
+    callee = _callsites.receiver_text(expr.func).split(".")[-1]
+    if callee != "field":
+        return ""
+    for kw in expr.keywords:
+        if kw.arg == "default_factory":
+            return _callsites.receiver_text(kw.value)
+    return ""
+
+
+def _is_property_node(fnode: ast.AST) -> bool:
+    if not isinstance(fnode, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    for dec in fnode.decorator_list:
+        dname = _callsites.receiver_text(dec).split(".")[-1]
+        if dname in ("property", "cached_property"):
+            return True
+    return False
+
+
+def local_bound_names(fnode: ast.AST) -> Set[str]:
+    """收集当前函数形参及局部赋值绑定名（不含内部 def/class 声明名），用于识别普通局部变量。"""
+    bound: Set[str] = set()
+    if isinstance(fnode, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        args = (
+            list(getattr(fnode.args, "posonlyargs", []))
+            + list(fnode.args.args)
+            + list(fnode.args.kwonlyargs)
+        )
+        for arg in args:
+            bound.add(arg.arg)
+        if fnode.args.vararg:
+            bound.add(fnode.args.vararg.arg)
+        if fnode.args.kwarg:
+            bound.add(fnode.args.kwarg.arg)
+    for sub in _callsites.walk_runtime_body(fnode):
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+            bound.add(sub.id)
+        elif isinstance(sub, ast.ExceptHandler) and isinstance(sub.name, str):
+            bound.add(sub.name)
+    return bound
+
+
+def collect_value_references(fnode: ast.AST) -> Set[str]:
+    """收集函数体内作为值传递/返回/装入容器的裸名（补充 call_argument_references）。"""
+    refs = set(_callsites.call_argument_references(fnode))
+    for sub in _callsites.walk_runtime_body(fnode):
+        if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Name):
+            refs.add(sub.value.id)
+        elif isinstance(sub, (ast.Tuple, ast.List, ast.Set)):
+            for elt in sub.elts:
+                if isinstance(elt, ast.Name):
+                    refs.add(elt.id)
+        elif isinstance(sub, ast.Dict):
+            for val in sub.values:
+                if isinstance(val, ast.Name):
+                    refs.add(val.id)
+        elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub is not fnode:
+            # 嵌套函数若有装饰器（如 @app.after_request），视为已被外层注册引用
+            if sub.decorator_list:
+                refs.add(sub.name)
+    return refs
+
+
+def filter_attr_candidates(
+    caller_rel: str,
+    method_name: str,
+    candidates: List[str],
+    all_funcs: Dict[str, Dict[str, Any]],
+    local_imports: Dict[str, str],
+) -> List[str]:
+    """过滤未消解属性调用的候选目标，剔除内置容器重名方法与跨文件私有类假边。"""
+    if method_name in CONTAINER_METHODS:
+        return []
+    imported_modules = {
+        mod.replace(".", "/") for mod in local_imports.values()
+    }
+    filtered: List[str] = []
+    for cand in candidates:
+        cinfo = all_funcs.get(cand)
+        if not cinfo:
+            continue
+        cls_name = cinfo.get("cls")
+        if cls_name is None:
+            continue
+        cand_rel = str(cinfo.get("rel") or "")
+        if str(cls_name).startswith("_") and cand_rel != caller_rel:
+            cand_stem = cand_rel[:-3] if cand_rel.endswith(".py") else cand_rel
+            if cls_name not in local_imports and not any(
+                imp == cand_stem or imp.startswith(cand_stem + "/") for imp in imported_modules
+            ):
+                continue
+        filtered.append(cand)
+    return filtered
 
 
 class TypeResolver:
@@ -94,13 +207,13 @@ class TypeResolver:
         self.trees = trees
         self.all_funcs = all_funcs
         self.file_imports = file_imports
-        # class_key = "rel::ClassName"
         self.classes_by_name: Dict[str, List[str]] = defaultdict(list)
         self.class_bases: Dict[str, List[str]] = defaultdict(list)
         self.class_methods: Dict[str, Dict[str, str]] = defaultdict(dict)
         self.class_attr_types: Dict[str, Dict[str, str]] = defaultdict(dict)
         self.func_return_class: Dict[str, str] = {}
         self.func_by_bare_name: Dict[str, List[str]] = defaultdict(list)
+        self.property_names: Set[str] = set()
         self._build_class_index()
         self._build_return_and_attr_types()
 
@@ -122,6 +235,8 @@ class TypeResolver:
             if info.get("cls") and not info.get("nested"):
                 ckey = f"{info['rel']}::{info['cls']}"
                 self.class_methods[ckey][info["name"]] = qual
+                if _is_property_node(info["node"]):
+                    self.property_names.add(info["name"])
         for ckey, (rel, base_names) in raw_bases.items():
             for bname in base_names:
                 resolved = self.resolve_class_name(rel, bname)
@@ -165,39 +280,66 @@ class TypeResolver:
             return cands[0]
         return None
 
+    def _resolve_type_or_builtin(
+        self,
+        rel: str,
+        type_name: str,
+        local_imports: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        if not type_name:
+            return None
+        rcls = self.resolve_class_name(rel, type_name, local_imports)
+        if rcls:
+            return rcls
+        if type_name.split(".")[-1] in BUILTIN_ANNOTATIONS or type_name.split(".")[-1] in BUILTIN_CONSTRUCTORS:
+            return BUILTIN_TYPE_TAG
+        return None
+
     def _build_return_and_attr_types(self) -> None:
-        # 1) 函数返回类型注解 + 类体属性类型注解
+        # 1) 类体属性类型注解 + dataclass field(default_factory=...)
         for rel, tree in self.trees.items():
             for node in tree.body:
                 if isinstance(node, ast.ClassDef):
                     ckey = f"{rel}::{node.name}"
                     for item in node.body:
                         if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
-                            tname = _unwrap_annotation(item.annotation)
-                            rcls = self.resolve_class_name(rel, tname)
+                            fac = _extract_dataclass_default_factory(item.value)
+                            rcls = self.resolve_class_name(rel, fac) if fac else None
+                            if not rcls:
+                                tname = _unwrap_annotation(item.annotation)
+                                rcls = self._resolve_type_or_builtin(rel, tname)
+                            if not rcls and fac:
+                                rcls = self._resolve_type_or_builtin(rel, fac)
                             if rcls:
                                 self.class_attr_types[ckey][item.target.id] = rcls
+                        elif isinstance(item, ast.Assign):
+                            fac = _extract_dataclass_default_factory(item.value)
+                            rcls = self._resolve_type_or_builtin(rel, fac) if fac else None
+                            if rcls:
+                                for tgt in item.targets:
+                                    if isinstance(tgt, ast.Name):
+                                        self.class_attr_types[ckey][tgt.id] = rcls
+
+        # 2) 函数返回类型注解或唯一返回构造
         for qual, info in self.all_funcs.items():
             fnode = info["node"]
             if isinstance(fnode, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 ret_name = _unwrap_annotation(fnode.returns)
-                rcls = self.resolve_class_name(info["rel"], ret_name)
+                rcls = self._resolve_type_or_builtin(info["rel"], ret_name)
                 if rcls:
                     self.func_return_class[qual] = rcls
-                # 若无返回注解，检查是否所有 return 均直接返回同一个类构造 Cls(...)
                 elif fnode.returns is None:
                     ret_classes: Set[str] = set()
                     for sub in _callsites.walk_runtime_body(fnode):
-                        if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Call):
-                            cname = _callsites.receiver_text(sub.value.func)
-                            rc = self.resolve_class_name(info["rel"], cname)
+                        if isinstance(sub, ast.Return) and sub.value is not None:
+                            rc = self._expr_class(info["rel"], None, sub.value, {})
                             if rc:
                                 ret_classes.add(rc)
                     if len(ret_classes) == 1:
                         self.func_return_class[qual] = next(iter(ret_classes))
 
-        # 2) 扫描每个类的 __init__ 等方法，推导 self.attr = Cls(...) 或 self.attr = param
-        for qual, info in self.all_funcs.items():
+        # 3) 扫描每个类的 __init__ 等方法，推导 self.attr = Cls(...) 或 self.attr = param
+        for info in self.all_funcs.values():
             if not info.get("cls") or info.get("nested"):
                 continue
             fnode = info["node"]
@@ -209,7 +351,9 @@ class TypeResolver:
             for sub in _callsites.walk_runtime_body(fnode):
                 if isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Attribute):
                     if isinstance(sub.target.value, ast.Name) and sub.target.value.id == "self":
-                        rcls = self.resolve_class_name(rel, _unwrap_annotation(sub.annotation))
+                        rcls = self._resolve_type_or_builtin(rel, _unwrap_annotation(sub.annotation))
+                        if not rcls and sub.value is not None:
+                            rcls = self._expr_class(rel, ckey, sub.value, param_types)
                         if rcls:
                             self.class_attr_types[ckey][sub.target.attr] = rcls
                 elif isinstance(sub, ast.Assign) and sub.value is not None:
@@ -238,11 +382,9 @@ class TypeResolver:
             if arg.arg in ("self", "cls") or arg.annotation is None:
                 continue
             ann_name = _unwrap_annotation(arg.annotation)
-            rcls = self.resolve_class_name(rel, ann_name, local_imports)
+            rcls = self._resolve_type_or_builtin(rel, ann_name, local_imports)
             if rcls:
                 out[arg.arg] = rcls
-            elif ann_name.split(".")[-1] in BUILTIN_ANNOTATIONS:
-                out[arg.arg] = BUILTIN_TYPE_TAG
         return out
 
     def _expr_class(
@@ -262,6 +404,18 @@ class TypeResolver:
             return BUILTIN_TYPE_TAG
         if isinstance(expr, ast.Name):
             return env.get(expr.id)
+        if isinstance(expr, ast.IfExp):
+            left = self._expr_class(rel, current_cls, expr.body, env, local_imports)
+            if left and left != BUILTIN_TYPE_TAG:
+                return left
+            right = self._expr_class(rel, current_cls, expr.orelse, env, local_imports)
+            return right or left
+        if isinstance(expr, ast.BoolOp):
+            for val in expr.values:
+                rc = self._expr_class(rel, current_cls, val, env, local_imports)
+                if rc and rc != BUILTIN_TYPE_TAG:
+                    return rc
+            return None
         if isinstance(expr, ast.Attribute):
             if isinstance(expr.value, ast.Name) and expr.value.id == "self" and current_cls:
                 return self._lookup_class_attr(current_cls, expr.attr)
@@ -269,21 +423,18 @@ class TypeResolver:
             callee = _callsites.receiver_text(expr.func)
             if callee in BUILTIN_CONSTRUCTORS or callee.split(".")[-1] in BUILTIN_CONSTRUCTORS:
                 return BUILTIN_TYPE_TAG
-            # 1) 直接类名实例化 Cls(...) 或 mod.Cls(...)
             rcls = self.resolve_class_name(rel, callee, local_imports)
             if rcls:
                 return rcls
-            # 2) cls(...) / self.__class__(...)
             if callee in ("cls", "self.__class__") and current_cls:
                 return current_cls
-            # 3) 已知返回类型的函数或方法调用
             if isinstance(expr.func, ast.Name):
                 cands = self.func_by_bare_name.get(expr.func.id, [])
                 if len(cands) == 1 and cands[0] in self.func_return_class:
                     return self.func_return_class[cands[0]]
             elif isinstance(expr.func, ast.Attribute):
                 recv_cls = self._expr_class(rel, current_cls, expr.func.value, env, local_imports)
-                if recv_cls:
+                if recv_cls and recv_cls != BUILTIN_TYPE_TAG:
                     mqual = self.lookup_method(recv_cls, expr.func.attr)
                     if mqual and mqual in self.func_return_class:
                         return self.func_return_class[mqual]
@@ -329,9 +480,7 @@ class TypeResolver:
         for sub in _callsites.walk_runtime_body(fnode):
             if isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Name):
                 ann_name = _unwrap_annotation(sub.annotation)
-                rcls = self.resolve_class_name(rel, ann_name, local_imports)
-                if not rcls and ann_name.split(".")[-1] in BUILTIN_ANNOTATIONS:
-                    rcls = BUILTIN_TYPE_TAG
+                rcls = self._resolve_type_or_builtin(rel, ann_name, local_imports)
                 if not rcls and sub.value is not None:
                     rcls = self._expr_class(rel, current_cls, sub.value, env, local_imports)
                 if rcls:
@@ -368,8 +517,8 @@ class TypeResolver:
             parts = receiver.split(".")[1:]
             cur: Optional[str] = current_cls
             for part in parts:
-                if not cur:
-                    return None
+                if not cur or cur == BUILTIN_TYPE_TAG:
+                    return cur
                 if part.endswith("()"):
                     mqual = self.lookup_method(cur, part[:-2])
                     cur = self.func_return_class.get(mqual, None) if mqual else None
@@ -381,12 +530,47 @@ class TypeResolver:
             cur = env.get(head)
             if cur:
                 for part in tail.split("."):
-                    if not cur:
-                        return None
+                    if not cur or cur == BUILTIN_TYPE_TAG:
+                        return cur
                     cur = self._lookup_class_attr(cur, part)
                 return cur
             return self.resolve_class_name(rel, receiver, local_imports)
         return self.resolve_class_name(rel, receiver, local_imports)
+
+    def _collect_property_reads(
+        self,
+        qual: str,
+        rel: str,
+        current_cls: Optional[str],
+        fnode: ast.AST,
+        env: Dict[str, str],
+        local_imports: Dict[str, str],
+    ) -> List[Edge]:
+        if not self.property_names:
+            return []
+        call_funcs: Set[int] = set()
+        prop_reads: Set[Tuple[str, str]] = set()
+        for sub in _callsites.walk_runtime_body(fnode):
+            if isinstance(sub, ast.Call):
+                call_funcs.add(id(sub.func))
+            elif (
+                isinstance(sub, ast.Attribute)
+                and isinstance(sub.ctx, ast.Load)
+                and id(sub) not in call_funcs
+                and sub.attr in self.property_names
+            ):
+                recv = _callsites.receiver_text(sub.value)
+                if recv:
+                    prop_reads.add((recv, sub.attr))
+        edges: List[Edge] = []
+        for recv, prop_name in sorted(prop_reads):
+            rcls = self.resolve_receiver_class(recv, rel, current_cls, env, local_imports)
+            if not rcls or rcls == BUILTIN_TYPE_TAG:
+                continue
+            target_qual = self.lookup_method(rcls, prop_name)
+            if target_qual and target_qual != qual:
+                edges.append({"from": qual, "to": target_qual, "kind": "typed", "ambiguous": False})
+        return edges
 
     def resolve_attr_calls(
         self,
@@ -395,22 +579,20 @@ class TypeResolver:
         calls: Set[AttrCall],
         local_imports: Dict[str, str],
     ) -> Tuple[List[Edge], Set[AttrCall]]:
-        """Tier 1：消解已知接收者类型的属性方法调用，并过滤内置容器/外部模块调用。"""
-        if not calls:
-            return [], set()
+        """Tier 1：消解已知接收者类型的属性方法调用与 @property 访问，并过滤内置容器/外部模块调用。"""
         rel = info["rel"]
         current_cls = f"{rel}::{info['cls']}" if info.get("cls") else None
         env = self.infer_function_env(info, local_imports)
-        typed_edges: List[Edge] = []
+        typed_edges: List[Edge] = self._collect_property_reads(
+            qual, rel, current_cls, info["node"], env, local_imports
+        )
         resolved: Set[AttrCall] = set()
         for call in sorted(calls):
             receiver, method_name, _line = call
-            # 1) 若接收者本身是已 import 的模块名（且未在第一方 module_import_attr 中命中），属外部库调用
             base_head = receiver.split(".")[0].rstrip("()")
             if base_head in local_imports and not self.resolve_class_name(rel, base_head, local_imports):
                 resolved.add(call)
                 continue
-            # 2) 若接收者是容器下标/内置链式调用（如 d.setdefault()、rows[]）且调用常见容器方法
             if (
                 receiver.endswith(("[]", ".setdefault()", ".get()", ".values()", ".keys()", ".items()", ".splitlines()", ".split()", ".strip()"))
                 and method_name in CONTAINER_METHODS
@@ -450,9 +632,8 @@ def apply_deep_resolution(
         "runtime_added_dynamic": 0,
     }
     confirmed_pairs: Set[Tuple[str, str]] = set()
-    confirmed_attr_names: Set[Tuple[str, str]] = set()  # (from_qual, method_name)
+    confirmed_attr_names: Set[Tuple[str, str]] = set()
 
-    # 1) SCIP 索引消歧
     if scip_index_path and os.path.isfile(scip_index_path):
         scip_pairs, scip_external_attrs = _extract_scip_call_pairs(repo_root, scip_index_path, all_funcs)
         for src, dst in scip_pairs:
@@ -461,7 +642,6 @@ def apply_deep_resolution(
             confirmed_attr_names.add((src, method_name))
         confirmed_attr_names.update(scip_external_attrs)
 
-    # 2) Runtime setprofile 动态调用边消歧
     runtime_pairs: Set[Tuple[str, str]] = set()
     if runtime_edges_path and os.path.isfile(runtime_edges_path):
         with open(runtime_edges_path, encoding="utf-8") as fh:
@@ -496,7 +676,6 @@ def apply_deep_resolution(
         elif edge["kind"] == "attr":
             mname = edge["to"].split("::")[-1].split(".")[-1]
             if (edge["from"], mname) in confirmed_attr_names:
-                # 同一 (caller, method_name) 已被 SCIP/Runtime 确认指向其他真实类，剪除未命中的同名假候选
                 stats["scip_pruned_false_candidates"] += 1
                 continue
             new_edges.append(edge)
@@ -535,7 +714,6 @@ def _extract_scip_call_pairs(
     except ValueError:
         return set(), set()
 
-    # 1) 建立 SCIP symbol -> qual 映射（按 rel + 函数名 + 行号区间匹配）
     funcs_by_rel_name: Dict[Tuple[str, str], List[Tuple[int, int, str]]] = defaultdict(list)
     funcs_by_rel: Dict[str, List[Tuple[int, int, str]]] = defaultdict(list)
     for qual, info in all_funcs.items():
@@ -545,12 +723,14 @@ def _extract_scip_call_pairs(
         funcs_by_rel[rel].append((lo, hi, qual))
 
     sym_to_qual: Dict[str, str] = {}
-    method_sym_re = re.compile(r"[/#]([A-Za-z_][A-Za-z0-9_]*)\(\)\.$")
+    doc_calibrated_spans: Dict[str, List[Tuple[int, int, str]]] = {}
+    method_sym_re = re.compile(r"[/#]([A-Za-z_][A-Za-z0-9_]*)(?:\(\))?\.$")
     for doc in docs:
         rel = str(doc.get("relative_path") or doc.get("path") or "")
+        def_lines_by_qual: Dict[str, int] = {}
         for occ in doc.get("occurrences") or []:
             roles = int(occ.get("symbol_roles") or occ.get("symbolRoles") or 0)
-            if not (roles & 1):  # DEFINITION_ROLE = 1
+            if not (roles & 1):
                 continue
             sym = str(occ.get("symbol") or "")
             m = method_sym_re.search(sym)
@@ -560,21 +740,30 @@ def _extract_scip_call_pairs(
             cands = funcs_by_rel_name.get((rel, fname), [])
             if not cands:
                 continue
+            rng = occ.get("range") or []
+            scip_line = (int(rng[0]) + 1) if rng else 0
             if len(cands) == 1:
-                sym_to_qual[sym] = cands[0][2]
-            else:
-                rng = occ.get("range") or []
-                line = (int(rng[0]) + 1) if rng else 0
-                matched = [q for lo, hi, q in cands if lo - 5 <= line <= hi]
-                if len(matched) == 1:
-                    sym_to_qual[sym] = matched[0]
+                qual = cands[0][2]
+                sym_to_qual[sym] = qual
+                if scip_line:
+                    def_lines_by_qual[qual] = scip_line
+            elif scip_line:
+                best = min(cands, key=lambda item: abs(item[0] - scip_line))
+                if abs(best[0] - scip_line) <= 40:
+                    sym_to_qual[sym] = best[2]
+                    def_lines_by_qual[best[2]] = scip_line
+        calibrated: List[Tuple[int, int, str]] = []
+        for lo, hi, qual in funcs_by_rel.get(rel, []):
+            scip_lo = def_lines_by_qual.get(qual, lo)
+            delta = scip_lo - lo
+            calibrated.append((lo + delta, hi + delta, qual))
+        doc_calibrated_spans[rel] = calibrated
 
-    # 2) 遍历非定义引用：第一方目标进 pairs，标准库/第三方已知方法进 external_attrs 剪除假模糊边
     pairs: Set[Tuple[str, str]] = set()
     external_attrs: Set[Tuple[str, str]] = set()
     for doc in docs:
         rel = str(doc.get("relative_path") or doc.get("path") or "")
-        spans = funcs_by_rel.get(rel, [])
+        spans = doc_calibrated_spans.get(rel) or funcs_by_rel.get(rel, [])
         if not spans:
             continue
         for occ in doc.get("occurrences") or []:
@@ -582,6 +771,8 @@ def _extract_scip_call_pairs(
             if roles & 1:
                 continue
             sym = str(occ.get("symbol") or "")
+            if sym.startswith("local "):
+                continue
             rng = occ.get("range") or []
             if not rng:
                 continue
@@ -593,8 +784,7 @@ def _extract_scip_call_pairs(
             target_qual = sym_to_qual.get(sym)
             if target_qual and target_qual != caller_qual:
                 pairs.add((caller_qual, target_qual))
-            elif "#" in sym and sym.endswith("()."):
-                # SCIP 已明确将该属性方法消解到标准库或第三方包（如 builtins.list#append().）
+            elif "#" in sym:
                 m = method_sym_re.search(sym)
                 if m:
                     external_attrs.add((caller_qual, m.group(1)))

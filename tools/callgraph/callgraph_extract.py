@@ -151,6 +151,7 @@ def _add_bare_edges(
     name_to_quals: Dict[str, List[str]],
     imports: Dict[str, str],
     all_funcs: Dict[str, FuncInfo],
+    bound_vars: Set[str],
 ) -> None:
     for name in sorted(names):
         imported = imports.get(name)
@@ -167,7 +168,12 @@ def _add_bare_edges(
         if len(local_candidates) > 1:
             edges.extend(_edge(qual, candidate, "local", True) for candidate in local_candidates)
             continue
-        candidates = sorted(name_to_quals.get(name, []))
+        if name in bound_vars:
+            continue
+        candidates = sorted(
+            c for c in name_to_quals.get(name, [])
+            if all_funcs[c].get("cls") is None and not all_funcs[c].get("nested")
+        )
         if len(candidates) == 1:
             edges.append(_edge(qual, candidates[0], "name", False))
         elif len(candidates) > 1:
@@ -177,7 +183,8 @@ def _add_bare_edges(
 def _add_attr_edges(edges: List[Dict[str, Any]], qual: str, info: FuncInfo,
                     calls: Set[Tuple[str, str, int]], methods: Set[str],
                     name_to_quals: Dict[str, List[str]],
-                    all_funcs: Dict[str, FuncInfo]) -> None:
+                    all_funcs: Dict[str, FuncInfo],
+                    imports: Dict[str, str]) -> None:
     self_methods: Set[str] = set()
     unresolved_names: Set[str] = set()
     for receiver, name, _line in sorted(calls):
@@ -188,10 +195,8 @@ def _add_attr_edges(edges: List[Dict[str, Any]], qual: str, info: FuncInfo,
     for name in sorted(self_methods):
         edges.append(_edge(qual, f"{info['rel']}::{info['cls']}.{name}", "self", False))
     for name in sorted(unresolved_names):
-        candidates = sorted(
-            candidate for candidate in name_to_quals.get(name, [])
-            if candidate != qual and all_funcs[candidate].get("cls") is not None
-        )
+        raw_cands = [c for c in name_to_quals.get(name, []) if c != qual]
+        candidates = sorted(_tresolver.filter_attr_candidates(info["rel"], name, raw_cands, all_funcs, imports))
         if 1 <= len(candidates) <= 6:
             edges.extend(_edge(qual, candidate, "attr", True) for candidate in candidates)
 
@@ -223,14 +228,19 @@ def _add_imported_module_attr_edges(edges: List[Dict[str, Any]], qual: str,
 
 
 def _add_function_reference_edges(edges: List[Dict[str, Any]], qual: str, names: Set[str],
-                                  local: Dict[str, List[str]], name_to_quals: Dict[str, List[str]]) -> None:
+                                  local: Dict[str, List[str]], imports: Dict[str, str],
+                                  all_funcs: Dict[str, FuncInfo]) -> None:
     for name in sorted(names):
         if name in local:
-            edges.extend(_edge(qual, target, "function_reference", True) for target in local[name])
+            amb = len(local[name]) > 1
+            edges.extend(_edge(qual, target, "function_reference", amb) for target in local[name])
             continue
-        candidates = sorted(name_to_quals.get(name, []))
-        if len(candidates) == 1:
-            edges.append(_edge(qual, candidates[0], "function_reference", True))
+        imported = imports.get(name)
+        if imported and "." in imported:
+            module, _, attr = imported.rpartition(".")
+            target = _module_attr_target(module, attr, all_funcs)
+            if target:
+                edges.append(_edge(qual, target, "function_reference", False))
 
 
 def _resolve_edges(all_funcs: Dict[str, FuncInfo], name_to_quals: Dict[str, List[str]],
@@ -242,39 +252,27 @@ def _resolve_edges(all_funcs: Dict[str, FuncInfo], name_to_quals: Dict[str, List
     resolver = _tresolver.TypeResolver(trees, all_funcs, file_imports)
     for qual, info in sorted(all_funcs.items()):
         if info.get("nested") and isinstance(info["node"], ast.Lambda) and info.get("parent") in all_funcs:
-            edges.append(_edge(str(info["parent"]), qual, "lambda_definition", True))
+            edges.append(_edge(str(info["parent"]), qual, "lambda_definition", False))
         bare, attr, dyn, module_attr = _callsites.collect_calls(info["node"])
-        references = _callsites.call_argument_references(info["node"]) - bare
+        local_targets = _local_function_targets(file_funcs, info)
+        bound_vars = _tresolver.local_bound_names(info["node"]) - set(local_targets)
+        references = (_tresolver.collect_value_references(info["node"]) - bare) - bound_vars
         dataflow = _flow.collect(info["node"])
         if any(dataflow.values()):
             dataflow_nodes[qual] = dataflow
         if dyn:
             dynamic_unresolved.append({"func": qual, "rel": info["rel"], "line": info["line"], "hints": sorted(dyn)})
-        local_targets = _local_function_targets(file_funcs, info)
         imports = dict(file_imports.get(info["rel"], {}))
         imports.update(_findex.function_import_aliases(info["node"], info["rel"]))
-        _add_bare_edges(
-            edges,
-            qual,
-            bare,
-            local_targets,
-            name_to_quals,
-            imports,
-            all_funcs,
-        )
-        _add_function_reference_edges(edges, qual, references, local_targets, name_to_quals)
+        _add_bare_edges(edges, qual, bare, local_targets, name_to_quals, imports, all_funcs, bound_vars)
+        _add_function_reference_edges(edges, qual, references, local_targets, imports, all_funcs)
         resolved_module_attr = _add_imported_module_attr_edges(edges, qual, module_attr, imports, all_funcs)
         remaining_attr = attr - resolved_module_attr
         typed_edges, resolved_typed = resolver.resolve_attr_calls(qual, info, remaining_attr, imports)
         edges.extend(typed_edges)
         _add_attr_edges(
-            edges,
-            qual,
-            info,
-            remaining_attr - resolved_typed,
-            _method_names(file_funcs, info),
-            name_to_quals,
-            all_funcs,
+            edges, qual, info, remaining_attr - resolved_typed,
+            _method_names(file_funcs, info), name_to_quals, all_funcs, imports,
         )
     return edges, dynamic_unresolved, dataflow_nodes
 
