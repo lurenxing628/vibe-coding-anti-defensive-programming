@@ -46,11 +46,30 @@ def iter_py(root, dirs, extra_files=()):
             yield p
 
 
-def src(node, text):
-    try:
-        s = ast.get_source_segment(text, node) or ""
-    except Exception:
-        s = ""
+def _slice_utf8(line, start, end=None):
+    if line.isascii():
+        return line[start:end]
+    raw = line.encode("utf-8")
+    return raw[start:end].decode("utf-8", errors="replace")
+
+
+def src(node, lines):
+    lineno = getattr(node, "lineno", None)
+    col = getattr(node, "col_offset", None)
+    if lineno is None or col is None or lineno < 1 or lineno > len(lines):
+        return ""
+    end_lineno = getattr(node, "end_lineno", None) or lineno
+    end_col = getattr(node, "end_col_offset", None)
+    if end_lineno <= lineno:
+        s = _slice_utf8(lines[lineno - 1], col, end_col)
+    else:
+        capped_end = min(end_lineno, len(lines), lineno + 6)
+        parts = [_slice_utf8(lines[lineno - 1], col)]
+        if capped_end > lineno + 1:
+            parts.extend(lines[lineno:capped_end - 1])
+        last_line = lines[capped_end - 1]
+        parts.append(_slice_utf8(last_line, 0, end_col if capped_end == end_lineno else None))
+        s = " ".join(parts)
     return " ".join(s.split())[:200]
 
 
@@ -87,8 +106,8 @@ def func_qual(node):
     return (c.name + "." if c else "") + f.name
 
 
-def is_empty_literal(node, text):
-    return src(node, text) in EMPTY_LITERAL_SRC
+def is_empty_literal(node, lines):
+    return src(node, lines) in EMPTY_LITERAL_SRC
 
 
 def names_in(node):
@@ -134,15 +153,14 @@ def params_of(fn):
     return pos, a.kwonlyargs, a.vararg, a.kwarg
 
 
-def annotation_src(arg, text):
-    return src(arg.annotation, text) if arg.annotation is not None else ""
+def annotation_src(arg, lines):
+    return src(arg.annotation, lines) if arg.annotation is not None else ""
 
 
 class FileScan:
     def __init__(self, root, path, text, tree, prod):
         self.root = root
         self.path = rel(root, path)
-        self.text = text
         self.tree = tree
         self.prod = prod
         self.lines = text.splitlines()
@@ -163,7 +181,7 @@ class FileScan:
 
 
 def scan_python_file(fs, out):
-    t = fs.text
+    t = fs.lines
     tree = fs.tree
     for node in ast.walk(tree):
         # 1 反射探测 #10 / F
@@ -250,10 +268,10 @@ def scan_python_file(fs, out):
         decos = decorator_names(fn)
         cls = enclosing_class(fn)
         qual = (cls.name + "." if cls else "") + fn.name
+        stmt_names = [names_in(stmt) for stmt in body]
         # 9 参数进门即被覆盖 #42 #33
         for a in allp:
-            for stmt in body:
-                used = names_in(stmt)
+            for stmt, used in zip(body, stmt_names):
                 if a.arg not in used:
                     continue
                 if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
@@ -266,15 +284,13 @@ def scan_python_file(fs, out):
                             tnames |= {e.id for e in tg.elts if isinstance(e, ast.Name)}
                     if a.arg in tnames and stmt.value is not None and a.arg not in names_in(stmt.value):
                         out["param_overwritten"].append({"file": fs.path, "line": stmt.lineno, "func": qual, "param": a.arg,
-                                                         "code": src(stmt, fs.text)})
+                                                         "code": src(stmt, fs.lines)})
                 break
         # 10 未使用参数 #17 A
         if body and not any(d and FRAMEWORK_DECORATOR_RE.search(d) for d in decos):
             only_stub = all(isinstance(s, (ast.Pass, ast.Raise)) or (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)) for s in body)
             if not only_stub:
-                used = set()
-                for s in body:
-                    used |= names_in(s)
+                used = set().union(*stmt_names)
                 for a in allp:
                     if a.arg.startswith("_") or a.arg in used:
                         continue
@@ -300,10 +316,10 @@ def scan_python_file(fs, out):
                     ok = False
             star = (["*" + vararg.arg] if vararg else []) + (["**" + kwarg.arg] if kwarg else [])
             if ok and sorted(argnames) == sorted(pnames + star) and fn.name not in ("__call__",):
-                out["passthrough_wrapper"].append({"file": fs.path, "line": fn.lineno, "func": qual, "callee": src(call.func, fs.text),
+                out["passthrough_wrapper"].append({"file": fs.path, "line": fn.lineno, "func": qual, "callee": src(call.func, fs.lines),
                                                    "is_method": cls is not None})
         # 12 注解为具体类型的参数又做 isinstance / is None 检查 F
-        ann = {a.arg: annotation_src(a, fs.text) for a in allp}
+        ann = {a.arg: annotation_src(a, fs.lines) for a in allp}
         defaults_none = set()
         posdef = fn.args.defaults
         for a, d in zip(pos[len(pos) - len(posdef):], posdef):
@@ -316,17 +332,17 @@ def scan_python_file(fs, out):
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "isinstance" and len(n.args) == 2 \
                     and isinstance(n.args[0], ast.Name) and n.args[0].id in ann:
                 a_ann = ann[n.args[0].id]
-                tsrc = src(n.args[1], fs.text)
+                tsrc = src(n.args[1], fs.lines)
                 if a_ann and a_ann not in ("Any", "object") and "Union" not in a_ann and "Optional" not in a_ann and "|" not in a_ann \
                         and tsrc and (tsrc == a_ann or a_ann.endswith(tsrc) or tsrc.split(".")[-1] == a_ann.split("[")[0].split(".")[-1]):
                     out["isinstance_on_annotated"].append({"file": fs.path, "line": n.lineno, "func": qual, "param": n.args[0].id,
-                                                           "annotation": a_ann, "code": src(n, fs.text)})
+                                                           "annotation": a_ann, "code": src(n, fs.lines)})
             if isinstance(n, ast.Compare) and isinstance(n.left, ast.Name) and n.left.id in ann and len(n.ops) == 1 \
                     and isinstance(n.ops[0], (ast.Is, ast.IsNot)) and isinstance(n.comparators[0], ast.Constant) and n.comparators[0].value is None:
                 a_ann = ann[n.left.id]
                 if a_ann and n.left.id not in defaults_none and "Optional" not in a_ann and "None" not in a_ann and a_ann not in ("Any", "object"):
                     out["none_check_on_non_optional"].append({"file": fs.path, "line": n.lineno, "func": qual, "param": n.left.id,
-                                                              "annotation": a_ann, "code": src(n, fs.text)})
+                                                              "annotation": a_ann, "code": src(n, fs.lines)})
         # 13 默认值兜底后假必填校验 #18
         for i, stmt in enumerate(body[:-1]):
             if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name) \
@@ -334,22 +350,21 @@ def scan_python_file(fs, out):
                 name = stmt.targets[0].id
                 for nxt in body[i + 1:i + 4]:
                     if isinstance(nxt, ast.If):
-                        tsrc = src(nxt.test, fs.text)
+                        tsrc = src(nxt.test, fs.lines)
                         if tsrc in (f"{name} is None", f"not {name}") and any(isinstance(x, ast.Raise) for x in nxt.body):
                             out["default_then_required_check"].append({"file": fs.path, "line": stmt.lineno, "func": qual,
-                                                                        "code": src(stmt, fs.text) + " ... " + tsrc})
+                                                                        "code": src(stmt, fs.lines) + " ... " + tsrc})
         # 14 事务内套事务 / 事务内文件 I/O #62 #66 N
-        fsrc = src(fn, fs.text) if False else None
         has_in_tx_assert = any(isinstance(n, ast.Attribute) and n.attr == "in_transaction" for n in ast.walk(fn))
         for n in ast.walk(fn):
             if isinstance(n, (ast.With, ast.AsyncWith)):
-                ctx = " ".join(src(it.context_expr, fs.text) for it in n.items)
+                ctx = " ".join(src(it.context_expr, fs.lines) for it in n.items)
                 if re.search(r"transaction|immediate|write_lock|savepoint", ctx, re.I):
                     if has_in_tx_assert:
                         out["assert_tx_then_new_tx"].append({"file": fs.path, "line": n.lineno, "func": qual, "ctx": ctx})
                     for c in ast.walk(n):
                         if isinstance(c, ast.Call):
-                            cs = src(c.func, fs.text)
+                            cs = src(c.func, fs.lines)
                             if re.search(r"(^open$|\.open$|write_text|write_bytes|read_text|read_bytes|json\.dump$|shutil\.|os\.replace|os\.remove|unlink|hashlib\.|sha256)", cs):
                                 out["io_in_transaction"].append({"file": fs.path, "line": c.lineno, "func": qual, "ctx": ctx, "call": cs})
 
@@ -421,7 +436,7 @@ def cross_language_text(root):
 
 def scan_references(files, root, out):
     defs, refs_prod, refs_test, calls, uncalled = collect_defs_and_refs(files)
-    xlang = cross_language_text(root)
+    xlang_words = set(re.findall(r"\w+", cross_language_text(root)))
     for name, dl in defs.items():
         if len(dl) != 1 or len(name) < 4:
             continue
@@ -434,7 +449,7 @@ def scan_references(files, root, out):
         rp = refs_prod[name] - self_refs
         rt = refs_test[name]
         if rp == 0:
-            if re.search(r"\b" + re.escape(name) + r"\b", xlang):
+            if name in xlang_words:
                 continue
             kind = "test_only_reference" if rt else "zero_reference"
             out[kind].append({"file": d["file"], "line": d["line"], "name": name, "def_kind": d["kind"],
@@ -475,13 +490,13 @@ def scan_references(files, root, out):
                 return None
             pv = [passed(c) for c in prod_calls]
             tv = [passed(c) for c in test_calls]
-            dsrc = src(dv, d["fs"].text)
+            dsrc = src(dv, d["fs"].lines)
             if all(v is None for v in pv):
                 out["param_never_passed_in_prod"].append({"file": d["file"], "line": fn.lineno, "func": name, "param": pname,
                                                           "default": dsrc, "prod_calls": len(prod_calls),
                                                           "test_passes": sum(1 for v in tv if v is not None)})
             elif all(v is not None for v in pv):
-                vals = {src(v, c["fs"].text) for v, c in zip(pv, prod_calls)}
+                vals = {src(v, c["fs"].lines) for v, c in zip(pv, prod_calls)}
                 consts = all(isinstance(v, ast.Constant) for v in pv)
                 if dsrc == "None" and not any(isinstance(v, ast.Constant) and v.value is None for v in pv):
                     out["optional_always_passed"].append({"file": d["file"], "line": fn.lineno, "func": name, "param": pname,
@@ -518,7 +533,7 @@ def scan_modules(files, out):
         for s in body:
             if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name) and isinstance(s.value, ast.Name) \
                     and s.targets[0].id != "__all__" and s.targets[0].id != s.value.id and not s.targets[0].id.isupper():
-                out["module_alias"].append({"file": fs.path, "line": s.lineno, "code": src(s, fs.text)})
+                out["module_alias"].append({"file": fs.path, "line": s.lineno, "code": src(s, fs.lines)})
 
 
 def scan_comments(root, files, out):
@@ -556,13 +571,13 @@ def scan_tests(root, files, out):
     for fs in test_files:
         for n in ast.walk(fs.tree):
             if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load) and n.attr.startswith("_legacy"):
-                out["test_calls_legacy_private"].append({"file": fs.path, "line": n.lineno, "code": src(n, fs.text)})
+                out["test_calls_legacy_private"].append({"file": fs.path, "line": n.lineno, "code": src(n, fs.lines)})
             if isinstance(n, ast.Assign):
                 for tg in n.targets:
-                    if isinstance(tg, ast.Attribute) and isinstance(tg.value, ast.Attribute | ast.Name) and enclosing_func(n) is not None:
-                        base = src(tg.value, fs.text)
+                    if isinstance(tg, ast.Attribute) and isinstance(tg.value, (ast.Attribute, ast.Name)) and enclosing_func(n) is not None:
+                        base = src(tg.value, fs.lines)
                         if base in fs.import_names or "." in base and base.split(".")[0] in fs.import_names:
-                            out["test_global_module_patch"].append({"file": fs.path, "line": n.lineno, "code": src(n, fs.text)})
+                            out["test_global_module_patch"].append({"file": fs.path, "line": n.lineno, "code": src(n, fs.lines)})
     # .cjs 字面量文档测试 #9
     for dp, dns, fns in os.walk(os.path.join(root, "tests")):
         for fn in fns:
