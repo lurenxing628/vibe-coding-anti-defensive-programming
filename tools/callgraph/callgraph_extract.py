@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import argparse
 import ast
 import glob
 import json
@@ -25,6 +26,7 @@ if HERE not in sys.path:
 import callgraph_call_sites as _callsites  # 保留完整接收者的调用点提取 leaf helper
 import callgraph_dataflow as _flow  # 敏感值共现与风险数据流 leaf helper
 import callgraph_function_index as _findex  # callable/import alias AST 索引 leaf helper
+import callgraph_type_resolver as _tresolver  # 两档类型消解（Tier 1 AST + Tier 2 SCIP/Runtime）
 
 FIRST_PARTY_ROOTS = ("src", "core", "web", "data", "app", "tools", "scripts", "plugins", "desktop")
 EXCLUDE = {".git", "__pycache__", ".venv", "venv", "node_modules", "vendor",
@@ -36,6 +38,7 @@ IndexResult = Tuple[
     Dict[str, List[str]],
     Dict[str, List[FuncInfo]],
     Dict[str, Dict[str, str]],
+    Dict[str, ast.Module],
     List[str],
 ]
 EdgeResult = Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[str, List[str]]]]
@@ -73,6 +76,7 @@ def _index_codebase() -> IndexResult:
     name_to_quals: Dict[str, List[str]] = defaultdict(list)
     file_funcs: Dict[str, List[FuncInfo]] = defaultdict(list)
     file_imports: Dict[str, Dict[str, str]] = {}
+    trees: Dict[str, ast.Module] = {}
     parse_errors: List[str] = []
 
     for fp in _iter_py():
@@ -81,13 +85,15 @@ def _index_codebase() -> IndexResult:
         if error:
             parse_errors.append(error)
             continue
+        if tree is not None:
+            trees[rel] = tree
         funcs, imports = _collect(tree, rel) if tree is not None else ([], {})
         file_imports[rel] = imports
         for info in funcs:
             all_funcs[info["qual"]] = info
             name_to_quals[info["name"]].append(info["qual"])
             file_funcs[rel].append(info)
-    return all_funcs, name_to_quals, file_funcs, file_imports, parse_errors
+    return all_funcs, name_to_quals, file_funcs, file_imports, trees, parse_errors
 
 
 def _local_function_targets(
@@ -170,7 +176,8 @@ def _add_bare_edges(
 
 def _add_attr_edges(edges: List[Dict[str, Any]], qual: str, info: FuncInfo,
                     calls: Set[Tuple[str, str, int]], methods: Set[str],
-                    name_to_quals: Dict[str, List[str]]) -> None:
+                    name_to_quals: Dict[str, List[str]],
+                    all_funcs: Dict[str, FuncInfo]) -> None:
     self_methods: Set[str] = set()
     unresolved_names: Set[str] = set()
     for receiver, name, _line in sorted(calls):
@@ -181,7 +188,10 @@ def _add_attr_edges(edges: List[Dict[str, Any]], qual: str, info: FuncInfo,
     for name in sorted(self_methods):
         edges.append(_edge(qual, f"{info['rel']}::{info['cls']}.{name}", "self", False))
     for name in sorted(unresolved_names):
-        candidates = sorted(candidate for candidate in name_to_quals.get(name, []) if candidate != qual)
+        candidates = sorted(
+            candidate for candidate in name_to_quals.get(name, [])
+            if candidate != qual and all_funcs[candidate].get("cls") is not None
+        )
         if 1 <= len(candidates) <= 6:
             edges.extend(_edge(qual, candidate, "attr", True) for candidate in candidates)
 
@@ -224,10 +234,12 @@ def _add_function_reference_edges(edges: List[Dict[str, Any]], qual: str, names:
 
 
 def _resolve_edges(all_funcs: Dict[str, FuncInfo], name_to_quals: Dict[str, List[str]],
-                   file_funcs: Dict[str, List[FuncInfo]], file_imports: Dict[str, Dict[str, str]]) -> EdgeResult:
+                   file_funcs: Dict[str, List[FuncInfo]], file_imports: Dict[str, Dict[str, str]],
+                   trees: Dict[str, ast.Module]) -> EdgeResult:
     edges: List[Dict[str, Any]] = []
     dynamic_unresolved: List[Dict[str, Any]] = []
     dataflow_nodes: Dict[str, Dict[str, List[str]]] = {}
+    resolver = _tresolver.TypeResolver(trees, all_funcs, file_imports)
     for qual, info in sorted(all_funcs.items()):
         if info.get("nested") and isinstance(info["node"], ast.Lambda) and info.get("parent") in all_funcs:
             edges.append(_edge(str(info["parent"]), qual, "lambda_definition", True))
@@ -252,13 +264,17 @@ def _resolve_edges(all_funcs: Dict[str, FuncInfo], name_to_quals: Dict[str, List
         )
         _add_function_reference_edges(edges, qual, references, local_targets, name_to_quals)
         resolved_module_attr = _add_imported_module_attr_edges(edges, qual, module_attr, imports, all_funcs)
+        remaining_attr = attr - resolved_module_attr
+        typed_edges, resolved_typed = resolver.resolve_attr_calls(qual, info, remaining_attr, imports)
+        edges.extend(typed_edges)
         _add_attr_edges(
             edges,
             qual,
             info,
-            attr - resolved_module_attr,
+            remaining_attr - resolved_typed,
             _method_names(file_funcs, info),
             name_to_quals,
+            all_funcs,
         )
     return edges, dynamic_unresolved, dataflow_nodes
 
@@ -432,11 +448,37 @@ def _print_summary(summary: Dict[str, Any], risk: List[Dict[str, Any]]) -> None:
     print("\n产物目录: " + OUT_DIR)
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="函数级调用图提取器（支持 light 轻量 AST 档与 deep 重型 SCIP/Runtime 档）")
+    parser.add_argument(
+        "--mode",
+        choices=("light", "deep"),
+        default=os.environ.get("CALLGRAPH_MODE", "light"),
+        help="light=默认轻量 AST 类型消解(秒级)；deep=额外融合 SCIP 索引与运行时调用边",
+    )
+    parser.add_argument("--scip-index", default=None, help="deep 模式下指定 index.scip 路径")
+    parser.add_argument("--runtime-edges", default=None, help="deep 模式下指定 runtime_edges.json 路径")
+    parser.add_argument("--repo-root", default=None, help="指定待扫描仓库根目录（默认当前仓库根）")
+    args = parser.parse_args(argv)
+    if args.repo_root:
+        global REPO_ROOT
+        REPO_ROOT = os.path.abspath(args.repo_root)
+
     os.makedirs(OUT_DIR, exist_ok=True)
-    all_funcs, name_to_quals, file_funcs, file_imports, parse_errors = _index_codebase()
+    all_funcs, name_to_quals, file_funcs, file_imports, trees, parse_errors = _index_codebase()
     _raise_parse_errors(parse_errors)
-    edges, dynamic_unresolved, dataflow_nodes = _resolve_edges(all_funcs, name_to_quals, file_funcs, file_imports)
+    edges, dynamic_unresolved, dataflow_nodes = _resolve_edges(all_funcs, name_to_quals, file_funcs, file_imports, trees)
+    if args.mode == "deep":
+        scip_path = args.scip_index or os.path.join(REPO_ROOT, ".checkup", "scip", "index.scip")
+        rt_path = args.runtime_edges or os.path.join(REPO_ROOT, ".checkup", "callgraph_runtime", "runtime_edges.json")
+        edges, deep_stats = _tresolver.apply_deep_resolution(
+            REPO_ROOT,
+            edges,
+            all_funcs,
+            scip_index_path=scip_path,
+            runtime_edges_path=rt_path,
+        )
+        print(f"[deep 模式融合] {deep_stats}")
     fan_in, fan_out, ambiguous_fan_in, ambiguous_fan_out = _fan_counts(edges)
     summary, risk = _write_outputs(
         all_funcs,

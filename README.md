@@ -127,16 +127,23 @@ python3 -m tools.symbol_locator callees <func_name>
 ```
 *(注：首次运行或源码变更时会自动调用 `tools/callgraph/callgraph_extract.py` 重建静态调用图快照，需 Python 环境安装 `networkx`；`--at` 消歧可选依赖 `jedi`。)*
 
-### 4. 运行时动态调用图采集与静态×动态交叉对账（`runtime_callgraph_collect.py` & `callgraph_crossval.py`）
-由于 Python 动态特性（鸭子类型、高阶回调、动态注册等），纯静态 AST 调用图无法 100% 消解所有多态调用。本套件内置了基于 `sys.setprofile` / `threading.setprofile` 的**运行时动态调用边录像器**与**静态×动态对账器**：
+### 4. 两档调用图提取（`light` 轻量 AST 档 vs `deep` 重型 SCIP + Runtime 融合档）
+针对 Python 动态与多态调用，`callgraph_extract.py`（配合 `callgraph_type_resolver.py`）提供**轻量 / 重型两档消歧能力**：
+- **轻量档（`--mode light`，默认开启，0 外部依赖，秒级）**：
+  基于纯标准库 AST 构建类继承表，结合函数参数/返回值类型注解、类属性注解、`__init__` 实例属性赋值（`self.repo = Cls(...)`）与局部变量构造/上下文管理器绑定，将 `obj.method()` 与 `self.attr.method()` 直接消解为 `kind="typed", ambiguous=False` 的确信实线边，并自动过滤 Python 内置容器与标准库模块调用，单档即可消除超 50% 的属性调用模糊边。
+- **重型档（`--mode deep`，融合 SCIP Pyright 全量类型索引 + `sys.setprofile` 运行时录像）**：
+  在轻量档基础上，自动读取 SCIP 索引（`index.scip`）与 `runtime_callgraph_collect.py` 录制的运行时调用边（`runtime_edges.json`），将命中的模糊边升级为确信实线边、剪除同调用点的未命中同名假候选，并将纯动态派发（`getattr` / 高阶回调）补入主调用图，可消除超 73% 的属性调用模糊边。
+
 ```bash
-# 1) 先提取静态调用图（含确信边 confident 与模糊边 ambiguous）
-python3 tools/callgraph/callgraph_extract.py
+# 档次 1：轻量档（默认，秒级产出 .checkup/callgraph/）
+python3 tools/callgraph/callgraph_extract.py --mode light
 
-# 2) 在运行 pytest 时挂载 sys.setprofile 录制真实触发的 caller -> callee 边
-python3 tools/callgraph/runtime_callgraph_collect.py tests/
+# 档次 2：重型档（融合 SCIP 索引 + 运行时 setprofile 真实调用边）
+python3 -m tools.symbol_locator build-index                        # 可选：生成 .checkup/scip/index.scip
+python3 tools/callgraph/runtime_callgraph_collect.py tests/        # 可选：录制 .checkup/callgraph_runtime/runtime_edges.json
+python3 tools/callgraph/callgraph_extract.py --mode deep           # 融合产出高精度调用图
 
-# 3) 静态图 × 运行时边交叉对账（将运行时跑到的模糊边升级为实线、揪出静态漏掉的动态派发、过滤假孤岛）
+# 静态图 × 运行时边独立对账报告
 python3 tools/callgraph/callgraph_crossval.py
 ```
 
