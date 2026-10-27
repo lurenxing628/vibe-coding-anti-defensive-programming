@@ -127,7 +127,20 @@ python3 -m tools.symbol_locator callees <func_name>
 ```
 *(注：首次运行或源码变更时会自动调用 `tools/callgraph/callgraph_extract.py` 重建静态调用图快照，需 Python 环境安装 `networkx`；`--at` 消歧可选依赖 `jedi`。)*
 
-### 4. 死代码孤岛、跨模块私有导入与失效路径棘轮扫描
+### 4. 运行时动态调用图采集与静态×动态交叉对账（`runtime_callgraph_collect.py` & `callgraph_crossval.py`）
+由于 Python 动态特性（鸭子类型、高阶回调、动态注册等），纯静态 AST 调用图无法 100% 消解所有多态调用。本套件内置了基于 `sys.setprofile` / `threading.setprofile` 的**运行时动态调用边录像器**与**静态×动态对账器**：
+```bash
+# 1) 先提取静态调用图（含确信边 confident 与模糊边 ambiguous）
+python3 tools/callgraph/callgraph_extract.py
+
+# 2) 在运行 pytest 时挂载 sys.setprofile 录制真实触发的 caller -> callee 边
+python3 tools/callgraph/runtime_callgraph_collect.py tests/
+
+# 3) 静态图 × 运行时边交叉对账（将运行时跑到的模糊边升级为实线、揪出静态漏掉的动态派发、过滤假孤岛）
+python3 tools/callgraph/callgraph_crossval.py
+```
+
+### 5. 死代码孤岛、跨模块私有导入与失效路径棘轮扫描
 ```bash
 # 扫描 0 调用死代码孤岛（AST 快速模式 / SCIP 精确模式）
 python3 -m tools.scan_dead_code_islands --mode quick
