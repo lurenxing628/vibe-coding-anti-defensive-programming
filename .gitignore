@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.ruff_cache/
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
+.checkup/
+node_modules/
+dist/
+build/
