@@ -9,6 +9,7 @@
 ```text
 vibe-coding-anti-defensive-programming/
 ├── README.md                                  # 本说明文档
+├── LIMCODE_DEPLOYMENT.md                       # Limcode Test 原生映射与零拷贝部署方案
 ├── 反过度防御140项黑名单全集.md                   # 单文件完整版（4条第一性原理 + 15母题总结 + 140项实战案例全集）
 ├── skills/                                    # 核心工作流与方法论 Skills
 │   ├── agy-dual-model-pipeline/               # 反重力三模型流水线（Gemini 广撒网/首稿 + Claude 核验/返修 + Codex 反方/严审 + 主代理裁决）
@@ -22,6 +23,11 @@ vibe-coding-anti-defensive-programming/
 │   │       ├── claude_drive.py                # Claude Code tmux + hooks 多车道驱动器
 │   │       └── claude_view.py                 # Claude 实时终端观看器（claude watch [lane]）
 │   ├── omp-dual-model-pipeline/               # OMP 宿主双模型反转流水线（Gemini 4 Argon 分片编码 ↔ 原生 Codex 流式严审）
+│   │   ├── SKILL.md
+│   │   └── references/
+│   │       ├── blacklist.md
+│   │       └── blacklist-cases.md
+│   ├── limcode-dual-model-pipeline/           # Limcode Test 原生双模型流水线（explore / worker ↔ reviewer）
 │   │   ├── SKILL.md
 │   │   └── references/
 │   │       ├── blacklist.md
@@ -50,7 +56,7 @@ vibe-coding-anti-defensive-programming/
 ## 二、快速安装与接入
 
 ### 1. 安装 Skills
-根据你使用的宿主环境，将 `skills/` 下的目录复制到对应配置路径：
+根据你使用的宿主环境安装 `skills/` 下的对应目录；Limcode Test 使用目录链接，保持仓库为单一事实源：
 
 - **Antigravity (AGY) 宿主**：
   ```bash
@@ -64,6 +70,32 @@ vibe-coding-anti-defensive-programming/
   cp -r skills/omp-dual-model-pipeline ~/.agents/skills/
   cp -r skills/认知一致性 skills/stop-that-shit ~/.codex/skills/
   ```
+
+- **VS Code Limcode Test 宿主（零拷贝 Directory Junction / Symlink，保持单一事实源）**：
+  链接到本地仓库，不再复制一份技能；仓库更新即技能更新。以下命令从仓库根目录执行，目标同名目录须尚不存在；已有副本或旧链接应先核对并迁出，不直接覆盖。若迁移过 Limcode 数据目录，请将技能根路径替换为实际数据根下的 `skills`。
+
+  **Windows / PowerShell**（Directory Junction，无需管理员权限）：
+  ```powershell
+  $repoSkills = (Resolve-Path ./skills).Path
+  $limcodeSkills = "$env:APPDATA\Code\User\globalStorage\your-publisher.limcode-test\skills"
+  New-Item -ItemType Directory -Force -Path $limcodeSkills | Out-Null
+  foreach ($name in @('认知一致性', 'stop-that-shit', 'limcode-dual-model-pipeline')) {
+      New-Item -ItemType Junction -Path (Join-Path $limcodeSkills $name) -Target (Join-Path $repoSkills $name)
+  }
+  ```
+
+  **Linux / macOS / Bash**（Symlink）：
+  ```bash
+  REPO_SKILLS="$(pwd)/skills"
+  # Linux 默认路径；macOS 改为 "$HOME/Library/Application Support/Code/User/globalStorage/your-publisher.limcode-test/skills"
+  LIMCODE_SKILLS="${LIMCODE_SKILLS_DIR:-$HOME/.config/Code/User/globalStorage/your-publisher.limcode-test/skills}"
+  mkdir -p "$LIMCODE_SKILLS"
+  for name in "认知一致性" "stop-that-shit" "limcode-dual-model-pipeline"; do
+    ln -s "$REPO_SKILLS/$name" "$LIMCODE_SKILLS/$name"
+  done
+  ```
+
+  在 Limcode 设置页将 `explore` / `worker` 绑定 `gemini-4-argon`，`reviewer` 绑定 `gpt-6-astra-minor`；在对话中加载 `limcode-dual-model-pipeline` 验证扫描。完整设计映射、数据目录说明与部署步骤见 [LIMCODE_DEPLOYMENT.md](LIMCODE_DEPLOYMENT.md)。
 
 ### 2. 配置终端实时观看别名（可选，用于 `agy-dual-model-pipeline`）
 在 `~/.zshrc` 或 `~/.bashrc` 中添加辅助函数，即可在终端通过 `codex watch [lane]` / `claude watch [lane]` 实时观看各车道子代理的思考与执行过程：
