@@ -1,9 +1,9 @@
 # 反过度防御黑名单案例库
 
-> 这里收录已抓获的具体案例，是主表 [blacklist.md](blacklist.md) 的附录。派发任务时传主表；案例库不必通读，对某个母题拿不准时，按主表列出的编号来查。
-> - 编号永久不变，新案例在末尾顺延，旧报告和 SKILL.md 里的 `#27`、`#44` 这类引用始终有效；`#27.1` 表示第 27 条第 1 点。
-> - 每条标题下的“母题”行标注它归属的主表母题，排在第一个的是主归属。
-> - 新案例按主表“四、入库规则”追加：先归类，一条只写一种花样。
+> 这里收录已抓获的具体案例，是主表 [blacklist.md](blacklist.md) 的唯一事实源附录。派发任务时传主表；案例库不必通读，按需检索即可：
+> - 编号永久不变，仅当撞见主表与既有案例未覆盖的**新型代码结构花样**时才在末尾顺延立号（老套路换业务马甲不再重复入库）；旧报告和 SKILL.md 里的 `#27`、`#44` 这类引用始终有效，`#27.1` 表示第 27 条第 1 点。
+> - 每条标题下的 `> 母题：` 行是母题归属的**唯一事实源**（排在第一个的是主归属）；查某母题全部案例直接运行 `rg "^> 母题：.*<A-O>" references/blacklist-cases.md -B 1`。
+> - 新案例严格遵循主表“四、怎么用与入库规则”追加：先归类、控重去同质化，且严守“一条一事”。
 
 ### 1. 严禁对已通过边界/Contract 校验的受控结构重复判空与二次类型检查
 > 母题：F 重复校验
@@ -1134,3 +1134,539 @@
   - `strict_parse.py:is_exact_int_value` 用 `float(value)` + `abs(f - round(f)) <= 1e-9` 判定整数，把 `"1.0000000001"` 放行成 `1`，把 `"9007199254740993.0"` 精度截断改写成 `9007199254740992`。
 - **正确做法**：锁与安全屏障读取必须遵循 **Fail-Closed**：`OSError` 读取失败独立标记为 `"unreadable"` 并直接判定为活跃阻断，严禁进入自愈删除分支；精确整数解析统一走 `Decimal` 十进制整数判定，严禁经过 `float` 容差近似。
 
+
+### 141. 严禁“在 `content_text` / `packed` 快照哈希前再套一层 `plain_facts` / `typed` 全树递归深拷贝，或把同一份 `calendar_facts` 同时塞进顶层与子字典做双倍序列化”（Redundant Full-Tree Pre-Copy Before `content_text`, & Duplicate Subtree Serialization）
+> 母题：M 无用拷贝与往返转换 · G 重复计算
+
+- **典型坏习惯**：
+  - `plan/queries.py`、`metrics/facts.py`、`timeline_view.py`、`calendar_context.py` 与 `dashboard/facts.py` 在把内部状态字典交给 `bind_read_snapshot` / `content_text`（内部调用 `packed()`，已原生支持 `dict`/`list`/`tuple`/`date`/`datetime`/`bytes` 归一化且对纯 JSON 标量实行写时复制）之前，先无条件调一遍 `plain_facts(...)` 或 `typed(...)` 把整棵树深拷贝一遍，单次请求平白产生 26 万 ~ 81.8 万次递归函数调用；
+  - `plan/occupancy.py` 返回的 `occupancy_facts` 事实字典里又塞了一份 `"calendar": calendar_facts`，而外层 `workspace_dto.py` 已经把同一份 `calendar_facts` 放在 `facts["calendar"]` 顶层，导致快照哈希把整套日历事实重复遍历序列化两遍。
+- **正确做法**：只供 `content_text` / `bind_read_snapshot` 哈希签名的内部状态字典直接传入，交由 `packed()` 单次遍历处理，严禁前置套 `plain_facts` / `typed` 预拷贝；父级快照字典已挂载的子树不得在兄弟子字典中重复挂载。
+
+### 142. 严禁“用 `json.dumps` / `restore_snapshot` 给内存受控字典做字段等价比较或往返自检，或对未入选样本急切算哈希、每次 `load_strict_json` 调用重复构造闭包与 `JSONDecoder`”（Using `json.dumps` / `restore_snapshot` for In-Memory Dict Equality, Eagerly Hashing Unselected Samples, & Re-Instantiating `JSONDecoder` Per Call）
+> 母题：M 无用拷贝与往返转换 · F 重复校验 · E 先算后扔
+
+- **典型坏习惯**：
+  - `template_lineage_query.py` 在 `_prepare_origin` 中先调 `restore_snapshot(origin["instance_snapshot"])`（5,000 次 `json.loads` + `json.dumps` 往返校验），下一行又算 `state_snapshot(events[0]) != origin["instance_snapshot"]`（后者相等本身就已证明 `instance_snapshot` 规范且等于 `events[0]`）；后续 `_validate_events`、`_validate_semantic`、`_validate_current` 为比较两个内存字典在固定列上的值是否相等，又把两边各自 `snapshot()`（`json.dumps`）成字符串再比对，单次请求触发 45,504 次 `json.dumps`；
+  - `calibration/samples.py` 在 `_sample_origin` 中对全部 5,000 条候选记录无条件调 `content_text(state)` 计算 `sample_revision`，而列表/筛选项/导出视图只消费每个模板最多 20 条入选样本的 `sample_revision`；
+  - `strict_json.py:load_strict_json` 每次调用都在函数体内新建 `unique`/`finite`/`constant` 三个闭包并传给 `json.loads(...)`，导致 Python 3.8 标准库无法走 `_default_decoder`，每次调用都重新实例化 `JSONDecoder` 与 `py_make_scanner`（单请求重复构造 5,000+ 次）。
+- **正确做法**：内存字典固定列等价比较直接比对带类型的列值元组 `columns_signature(row, columns)`；对共享模板快照按文本去重缓存反序列化结果（只读字典直接复用，不再逐实例 `dict(...)` 拷贝）；仅在样本入选或进入单条详情/确认证据出口时按需计算 `sample_revision`；严格 JSON 解码器将钩子与 `JSONDecoder` 提升为模块级单例复用。
+
+### 143. 严禁“上游上下文已解析完时间区间，下游各投影却绕过 `datetime_intervals` 对同一批字符串重跑 8~10 遍 `parse_local_datetime` / `instant` / `public_time`，或底层已产出 `_parsed_intervals` 外层 `peek_source_intervals` 却因未同步挂载而恒返回 `None`”（Re-Parsing Identical Task Timestamps 8–10x Across Projections & `peek_source_intervals` Missing Completed Repo Intervals）
+> 母题：G 重复计算 · H 缓存失效 · M 无用拷贝与往返转换
+
+- **典型坏习惯**：
+  - 5,000 条任务的正式方案只有 10,000 个起止时间点，且 `PlanReadContext` / `PointPlanCatalogRepository.prepared_rows` 在入口已全部解析校验完毕，但下游 `delivery.py`（调 `task_intervals`）、`sequence_order.py`（调 `public_time`）、`timeline_graph.py` 与 `actual_timeline_chain.py`（传字符串进 `critical_chain._build_nodes` 重调 `parse_local_datetime`）、`dashboard/calendar_capture.py`、`outage.py`、`analysis_projection.py`（各自调 `instant`）全部丢弃上游已有的 `datetime` 区间，导致单次请求调 `parse_local_datetime` 高达 8.2 万 ~ 9.7 万次；
+  - `PointPlanCatalogRepository.prepared_rows` 已完成整份方案的 `_prepared_rows` 与 `_parsed_intervals`，但 `PlanReadContext.peek_source_intervals` 只查尚未挂载的 `self._intervals`，导致 `verify_arranged` 拿到 `None`（0% 命中）后把 10,000 个时间字符串重解析一遍，且当 `known_times is not None and row[key] == original[key]` 时仍对相同字符串再调一遍 `public_time(original[key])`；
+  - `execution_values.py:minutes(planned, actual)` 在 `actual`（如未完成记录的 `confirmed_finish`）为 `None` 时不短路，先把 `planned` 解析成 `datetime` 再在 `_minutes_between` 里因 `actual is None` 丢弃。
+- **正确做法**：时间区间在读取上下文（`PlanReadContext.intervals` / `datetime_intervals`）解析一次后，全链路（交付、执行顺序、关键链、占用、停用窗口、概览分析）统一消费已解析的 `(start_dt, end_dt)`；`peek_source_intervals` 直接对接底层已完成的 `_parsed_intervals`；二元计算函数（如 `minutes(planned, actual)`）在任一入参为 `None` 时必须在解析前立即短路。
+
+### 144. 严禁“在万次热路径中用未预编译的 `re.fullmatch(pattern, val)` 反复查正则缓存，或在 Python 3.8 中用 `ChainMap` 包装双层大字典触发数十万次生成器查找退化”（Uncompiled `re.fullmatch` in Hot Loops & `ChainMap` Lookup Degradation Over Large Dicts）
+> 母题：G 重复计算
+
+- **典型坏习惯**：
+  - `run_candidate.py:reference`、`execution_input.py:public_ref`、`preflight.py:public_ref` 在万次循环调用的校验函数里直接写 `re.fullmatch(r"[0-9a-f]{48}", value)`，每次调用都要经过 `re.py:fullmatch -> _compile` 查找模块缓存（单请求 3.5 万+ 次）；
+  - `history/conditions.py:prepare_history_condition_side` 用 `ChainMap(conditions.rows, baseline.rows)` 合并 10 万行的两层字典；在 Python 3.8 中 `ChainMap.get(k)` 每次执行 `k in self`（遍历 `self.maps` 的生成器表达式）再执行 `self[k]`（`try/except KeyError` 循环），21.9 万次查找触发 64.9 万次生成器函数调用，白耗 0.45 秒。
+- **正确做法**：高频校验的正则表达式必须在模块顶层 `re.compile(...)` 预编译并直接调 `_RE.fullmatch(value)`；只读合并两层字典供后续高频查找时，直接使用原生字典解包 `{**baseline.rows, **conditions.rows}`（C 层哈希表 O(1) 查找，快 40 倍）。
+
+### 145. 严禁“历史区间前缀和用 `float` 秒累加导致窗口差值发生基线漂移（产生 `-8.88e-16` 微负数与 `+2.22e-16` 假正数），或在下游用 `max(0.0, ...)` 夹断掩盖源头精度失真”（Accumulating Prefix Sums in `float` Causing Window-Difference Baseline Drift, or Clamping with `max(0.0, ...)` Downstream）
+> 母题：M 无用拷贝与往返转换 · O 语义走样 · K 吞错与静默降级
+
+- **典型坏习惯**：
+  - `IntervalIndex` 与 `_WeightedIndex` 将每个时间段 `(end - start).total_seconds()` 作为 `float` 秒累加进 `self.prefix = [0.0]`；由于 `known_span`、`span`、`calendar.occupied`、`calendar.load` 各自的历史累计基线不同，在取窗口差值 `(prefix[high] - prefix[low]) / 3600.0` 时发生 1~16 ULP 浮点有效位数截断：既在窗外时长为 0 的窗口产生 `-8.88e-16` 微负数（炸穿前端非负契约），又产生 `+2.22e-16` 假正数（误触发 `raw["outside_calendar_hours"] > 0` 把 790 个窗口的 `zero_capacity_task` 清空为 `None`）；
+  - 面对微负数报错时，若在下游 `resource_projection.py` 写 `max(0.0, span - occupied)` 夹断，虽能消掉负数报错，却放任全部假正数和 `zero_capacity_task` 误清空静默污染业务结果。
+- **正确做法**：凡基于 `datetime`（精度为微秒）的前缀和与加权区间索引，内部必须统一用 Python 精确整数微秒 `int`（`(end - start) // timedelta(microseconds=1)`）累加 `prefix = [0]`，仅在最终窗口差值输出时除以 `HOUR_MICROSECONDS`（`3_600_000_000.0`）或 `_SECOND_MICROSECONDS`，严禁在下游用 `max(0.0, ...)` 掩盖源头浮点漂移。
+
+### 146. 严禁“在只读校验链中对命中缓存的大归档无脑递归 `clone_json`，或把查缓存写在全量读取/复制之后、多处旁路绕过 `cached_generation_facts`，以及改为只读共享后在公开 DTO 小摘要边界漏做独立所有权隔离”（Recursive `clone_json` on Read-Only Cached Archives, Checking Cache After Full Copy, & Leaking Shared Mutable References in Public DTO Summary）
+> 母题：M 无用拷贝与往返转换 · H 缓存失效 · G 重复计算
+
+- **典型坏习惯**：
+  - `adoption_baseline_sources.py` 在只读核验正式方案来源时，先加载并深拷贝回执、候选、受理处置表和任务，下一行才查来源缓存；读取 `v2` 及其基准 `v1` 时合计触发 **197 万次 `clone_json` 递归调用**；
+  - `DecisionSource.facts`、`HistoryReader._run`、`simulation/base.py:_candidate` 与 `prepare_adoption_facts` 绕过 `CandidateStore.generation_facts` 直接调 `GenerationFacts(capture)` 重复建索引；
+  - 内部改为 `copy_on_read=False` 只读共享缓存对象后，公开 DTO 出口 `algorithm_summary(artifact)` 直接透传缓存中的可变字典 `origin`、`representative_objectives`，导致外部修改返回 DTO 时污染全局候选缓存。
+- **正确做法**：先查缓存再读库；内部只读校验链统一使用 `ReadOnlyCandidateStore`（`copy_on_read=False`）与 `cached_generation_facts(capture)` 零拷贝共享已解析对象；在公开 DTO 出口（如小摘要字段）或可变编辑草稿等需要独立所有权的边界显式拷贝隔离。
+
+### 147. 严禁单人单机离线软件搞“防进程内邪恶元类 / 防描述符 / 防 Monkey-Patch / 每次事务查 `sqlite_master` 验触发器 / `CASE WHEN 1 THEN` 绕转换器 / 删触发器造假测试”的被害妄想防御（Single-User Offline Anti-Tampering Paranoia: Metaclass/Descriptor/Monkey-Patch Guards, Per-Transaction Trigger DDL Lexing, `CASE WHEN 1` Converter Bypass, & Trigger-Dropping Fake Tests）
+> 母题：F 重复校验 · A 死分支、死参数、伪可选 · D 靠测试续命
+
+- **典型坏习惯**：
+  - 在单人单机无网桌面软件的核心热路径与缓存中，手写 `static_attribute.py` 遍历 `__mro__`、检查 `Py_TPFLAGS_HEAPTYPE` 与字段描述符、保存 `_ORIGINAL_*` / `_DEFAULT_*` 函数指针核对是否被进程内篡改；
+  - 每个读写事务挂载 `SchemaContractMemo` 查 `sqlite_master` 并跑手写 SQL 词法分析器比对 21 个模块的触发器 DDL；仓储 SQL 用 `CASE WHEN 1 THEN col END` 和 `CAST(+col AS BLOB)` 绕开 `sqlite3` 类型转换器，在 Python 里模拟 SQLite 四种存储类型混合排序；
+  - 读样本血缘时每次重放 5 万条历史事件重算 10 列签名；下载本地备份文件进内存前后毫秒级算两次签名防瞬时篡改；
+  - 在 57 个测试文件中编写 `corrupt_update`（先 `DROP TRIGGER` 再裸 SQL 塞 `NaN`/`True`/`b'bad-date'` 再重建触发器）和 `_UnhashableMeta` 邪恶元类假测试（2,800+ 行）为上述防篡改代码续命。
+- **正确做法**：Schema 与触发器完整性只在启动、迁移、外部备份恢复边界校验一次；运行期读写直接信任本进程事务与 SQLite 原生类型转换；彻底删除防元类/防 Monkey-Patch 探测、跨表回执反查自证、`CASE WHEN 1 THEN` 动态拼列及配套的删触发器/造元类假测试。
+
+### 148. 严禁“对自家优化器内部摘要做‘防泄密正则脱敏’与 9 级循环重序列化裁剪，或把整库 24–30 张表全量行与 DDL 转储成几十 MB JSON 当 `snapshot_ref`”（Regex Sanitization & 9-Stage Re-Serialization Trimming on Self-Generated Optimizer Summaries, & Dumping Whole-DB Tables as `snapshot_ref`）
+> 母题：F 重复校验 · G 重复计算 · M 无用拷贝与往返转换
+
+- **典型坏习惯**：
+  - 用 8 个文件（1,150 行）对自家优化器刚算出的摘要字典跑正则扫下划线/驼峰并替换成 `"内部标识已隐藏"`，候选方案 `label` 只要含 `_` 或无中文就直接丢弃；再用 600 行做 9 级循环 `canonical_json` 重序列化试探 64KB 体积上限；
+  - 预检、模拟与列表/看板读取不信任业务域已有的单调递增 `revision`，每次把 24–30 张表全量行与 DDL 捞出序列化成几十 MB JSON 当 `snapshot_ref` 或建 `:memory:` 库挂 `_restricted_authorizer` 逐格比对。
+- **正确做法**：自家优化器摘要在生成处直接按公开字段构造并对列表取固定条数上限；跨请求快照与写凭据统一绑定轻量级 `(scope, 领域 revision, 实体 revision, 业务日期)`，严禁全表/全库转储做指纹。
+
+### 149. 严禁“首屏接口无条件内联数 MB 低频明细导致大方案 `413` 超限，或分块/按需化后制造空态/未加载态/跨方案状态残留/微秒阈值断裂”（Inlining Multi-MB Low-Frequency Details in Initial Workspace Causing `413`, or Breaking Empty/Unloaded/Cross-Plan/Microsecond Contracts After Chunking）
+> 母题：E 先算后扔 · J 口径没在源头统一 · N 事务、锁与状态生命周期 · O 语义走样
+
+- **典型坏习惯**：
+  - `/workspace` 首屏无条件内联 `baseline.items`（6.65 MB，含与顶层重复的 `after`）、`algorithm.evaluations`（0.78 MB）、`timeline_graph.nodes`（3.74 MB）、`calendar.windows + occupancy.segments`（2.71 MB），导致 5,000～10,000 条任务编码完 13 MB JSON 后在出口触发 8 MiB `413` 超限；
+  - 按职责拆分为 `/tasks`、`/timeline-graph`、`/capacity`、`/baseline` 分块端点后：
+    1. 在无原安排（`state == "unavailable"`, `total == 0`）时用 `len(sliced) == total`（`0 == 0`）把 `items_complete` 误算为 `True`；
+    2. 在 `timeline_graph.nodes_complete === false`（未加载或读取失败）时，界面控件仍启用「显示关键链连线」复选框并把未知关键任务数渲染成 `"0 条关键任务"`；
+    3. 按需加载标志 `needed: true` 未绑定当前 `result` 身份，从方案 A 切到方案 B 时无需求也偷跑下载 `/baseline`；或仅在 `view === 'analysis'` 触发 `/capacity`，漏掉同样渲染资源窗口的 `view === 'delay'`；
+    4. 对缩小日期范围查询的完整依赖图误套全范围可见任务上限 `node_count <= 10000`；或摘要合同用业务显著性阈值 `overlap_hours > 1e-9` 代替 `overlap_hours > 0`，误拒合法的 1 微秒（`2.78e-10` 小时）正重叠段。
+- **正确做法**：首屏只返回当前核心安排与各投影汇总摘要，重型低频明细按职责分块共享同一 `snapshot_ref/as_of` 按需加载；不可用态（`unavailable`）的 `*_complete` 恒为 `False`；未加载/失败态必须禁用依赖完整明细的开关并显示“未加载/加载中/读取失败”；按需状态严格归属当前 `result` 身份并覆盖全部消费视图；结构存在性校验使用精确数学边界（`> 0`），不混用业务显著性阈值。
+
+### 150. 严禁“把旧快照 Token 核验放在重型图装配/台账投影之后，或在轻量读快照里仍夹带整树 `_guard`/公共大字典正文、为核对版本重复完整解码百万字节档案”（Validating Stale Read Token After Heavy Projection, Stuffing Full `_guard` Trees / Shared Catalogs into Lightweight Snapshot Tokens, & Re-Decoding Full Archives for Version Match）
+> 母题：E 先算后扔 · H 缓存失效 · G 重复计算
+
+- **典型坏习惯**：
+  - **先重型投影、后拒绝旧快照**：实时时间线、总览、报表、报表目录、看板、指标校准等入口携旧 `snapshot_token` 请求时，先跑完完整图装配、台账展示投影或模板/实例/血缘全量读取，最后在出口才核验 Token 返回 `409 snapshot_stale`；方案首屏无日期范围（`include_nodes=False`）仍完整构图并算完关键链后在出口丢掉 `nodes=[]`；
+  - **轻量快照夹带完整正文**：表面接入了源头版本机制，看板读快照仍把处置状态和全部条目的 `_guard` 整树序列化进 Token；单条目路由快照在已绑定公共字典版本的同时，还把 1,000+ 外部提供方的公共目录正文完整序列化进快照（单条目快照膨胀至 295 KB）；
+  - **版本核对重复解码大档案**：候选提交与后台 Worker 写锁明明已持有解析后的快照档案或轻量版本元数据，`snapshot_facts_match()` 却对 1.18 MB 档案再做一次完整 JSON 解码比对。
+- **正确做法**：读事务进门第一步先基于轻量来源版本（`source_revisions`）核验 `snapshot_token`，陈旧请求在任何重型读取与投影之前立即短路返回 `409`；`include_nodes=False` 等摘要模式直接消费已验证成员计数，跳过节点构图与关键链计算；读快照只绑定来源版本号与目标闭包，绝不夹带单条写守卫树或公共目录正文；已解析档案或版本元数据显式下传复用，严禁重复解码大档案。
+
+### 151. 严禁“按永久 `ref` 定位或读取已落库实体时，仍套用‘新编号录入禁止首尾空格’的校验规则，制造‘能运行却无法读取/授权/更新/删除’的半截子身份契约”（Applying New-Code Whitespace Rejection to Existing Stored Entities Resolved by Permanent `ref`）
+> 母题：O 语义走样 · J 口径没在源头统一
+
+- **典型坏习惯**：
+  - 核心执行链、冻结种子与最终保护已经遵循“读取侧保真”原样保留合法存量身份（如 `" M1 "`、`" O1 "`、`" ITEM1 "`），但受理固定资源/资格读取（`run_input_rows.py`、`worker_qualification.py`）、分组关系只读查询（`relations.py`），以及按永久 `ref` 维护既有实体的更新、单条/批量删除、关联选择与成员授权（`entities.py`、`vendors.py`、`states.py`、`worker_resource_permissions.py`、`inventory/service.py`、`inventory/bulk.py`）仍写 `if code != code.strip(): raise ...`；
+  - 结果同一条合法落库的带首尾空格资源或条目，要么在提交预览被当成脏文本阻断，要么能参与计算却无法通过永久 `ref` 查看关系、修改资料、配置授权或删除，甚至还会与同名无空格兄弟记录（`"M1"`、`"ITEM1"`）的维护边界割裂。
+- **正确做法**：严格区分**“新业务编码录入边界”**与**“已落库实体读取/按永久 `ref` 维护边界”**——首尾空格规范化与拒绝只归属 `create` 新建录入与按业务编码文本匹配的外部文件导入边界；一旦实体已落库并通过永久 `ref` 解析或进入内部读取链路，全链路（运行受理、资格池、关系查询、更新、单删/批删、关联选择、授权维护）必须 100% 信任并原样保留 `identity.entity_key`。
+
+### 152. 严禁“在内部只读投影链上层层防御性深拷贝，却在公开 DTO 出口直接裸返全局缓存中的可变列表/字典（内部瞎拷、出口裸奔）”（Defensive Deep-Copying Inside Read-Only Projections While Returning Raw Cached Mutables at Public DTO Exits）
+> 母题：M 无用拷贝与往返转换 · H 缓存失效
+
+- **典型坏习惯**：
+  - 一边在候选只读投影内部（`candidate_projection.py`）对不会原地修改的 `tasks`、`dispositions` 做多余的 `clone_json` / `dict()` 拷贝；
+  - 另一边在公开 DTO 出口——如时间线视图（`actual_timeline.py`）与工作区摘要（`workspace_dto.py`）直接返回全局图缓存对象、影响明细（`decision_impact.py`）直接将缓存的 `disposition["issues"]` 赋给公开字段 `constraints["reasons"]`、以及 `completion_scope.py` 与 `candidate_tasks.py` 的 `reasons`/`data_gaps`——直接把全局缓存内的可变 `list`/`dict` 引用裸露给外部调用方，导致调用方一旦原地修改返回值就静默污染进程级全局缓存。
+- **正确做法**：内部只读计算与投影链全程零拷贝共享缓存对象；所有权隔离严格且唯一地收口在**公开 DTO 组装出口**（如统一通过 `public_timeline_graph` 或对可变列表/字典字段在公开出口复制一次），做到“内部零冗余拷贝、公开出口零缓存泄漏”。
+
+### 153. 严禁“工具/门禁脚本中‘实际执行选择’与‘缓存指纹记录’各写一套探测逻辑，或核验日志原文后丢弃再二次读盘（TOCTOU）、同一条件判空后紧跟重复 `assert`”（Divergent Runtime Resolution vs. Cache Fingerprinting, Validate-Then-Re-Read Log TOCTOU, & Redundant Post-Check `assert`）
+> 母题：J 口径没在源头统一 · E 先算后扔 · F 重复校验
+
+- **典型坏习惯**：
+  - **探测与指纹分叉**：当 `PATH` 中存在“具有可执行权限但运行报错”的坏 Node 时，测试运行时（`node_runtime_support.py`）通过试跑 `--version` 跳过坏 Node 切到内置 `bundled Node`，而门禁指纹脚本（`long_gate_fingerprint.py`）却只按 `shutil.which` 路径存在性选中坏 Node 并记录 `version_unavailable`，导致缓存指纹没有绑定实际运行的 Node 版本；
+  - **先验后扔再读盘（TOCTOU）**：门禁续跑（`run_quality_gate.py`）在核验阶段已读出日志全文并验证通过，随即丢弃内存中的原文，到了构造复用结果时又重新从磁盘读一遍日志，中间一旦文件被改写就会把未核验正文当成通过结果；
+  - **判空后紧贴同条件 `assert`**：刚写完 `if x is None or y is None: return ...` 收窄类型，下一行紧接着写 `assert x is not None`、`assert y is not None` 重复判空。
+- **正确做法**：运行时选择与缓存指纹计算必须调用同一个可执行文件探测与版本核验函数；文件/日志核验通过后直接把已核验的内存原文（如 `reusable_log_texts`）显式传给下游消费，严禁丢弃后二次读盘；已由前置条件分支证明非空的变量严禁再写重复 `assert`。
+
+### 154. 严禁“主链路已收口为单一权威字段/单一准备上下文后，前后端仍保留被替代的准备旁路、恒空兼容参数或回退死分支”（Retaining Superseded Preparation Bypasses, Always-Empty Legacy Args, or Dead Fallback Branches After Unifying Authority）
+> 母题：A 死分支、死参数、伪可选 · B 多余的层 · C 清理不彻底
+
+- **典型坏习惯**：
+  - 外部提供方能力已由 `preparation.vendor_capabilities` 统一供给，`routing/vendors.py` 的 `group_vendor_check` 却仍留着无人消费的旧准备旁路与冗余回退参数；
+  - 后端看板候选对比响应已必返顶层权威 `time_scope`，前端 `DashboardCandidates.jsx` 仍保留 `: rangeFor(comparison.data.generation.input)` 回退死分支；`RouteSourceEditor.jsx` 在移除旧能力表后仍向 `vendorOptions` 传递恒空数组 `[]` 的兼容位置参数。
+- **正确做法**：当数据供给或字段契约统一到新权威入口后，必须顺着调用链把前后端旧准备旁路、恒空占位参数和回退死分支同步清理干净，并补齐单测 Mock 中漏配的权威字段（如 `time_scope`），绝不留“防万一”的旧尾巴。
+
+### 155. 严禁“高权限安装器/宿主用极窄路径黑名单（`IsTrustedInstallDir`）代替受控来源/写权限校验，优先执行用户可写目录中的既存二进制”（Blacklist-Based Directory Trust in Privileged Installer Executing User-Writable Binaries）
+> 母题：O 语义走样 · K 吞错与静默降级
+
+- **典型坏习惯**：
+  - 管理员权限运行的安装器在卸载或停止旧服务时，用 `IsTrustedInstallDir()` 仅排除 `Temp`、`Downloads` 等少数目录就把其余既存安装目录全部视为“可信”，并优先直接执行该目录中现有的 `app_service.exe` 而不使用安装包内受控释放的 helper；一旦管理员选择了普通用户可写的既存安装目录，其中预植的同名程序就会被管理员安装器直接执行。
+- **正确做法**：高权限安装器与宿主的执行信任边界必须基于受控来源（始终执行本次安装包在受控临时目录释放的自带 helper，或严格校验目标二进制及父目录 ACL 仅管理员可写），严禁用“排除几个常见目录的黑名单”充当信任校验，且停止屏障超时后必须立即中止安装，绝不忽略超时继续覆写文件。
+
+### 156. 严禁“删掉上层布尔开关时，偷偷把同义布尔开关与 `=None` 伪可选参数塞进下层 helper 合成双职责函数”（Moving Deleted Upstream Toggle into Downstream Helper as Dual-Mode Function）
+> 母题：L 删旧壳时搬家兜底 · A 死分支、死参数、伪可选 · J 口径没在源头统一
+
+- **典型坏习惯**：
+  - 被要求删掉上层读取入口（如 `CalibrationFacts.read(..., materialize_selected_records=False)`）的布尔开关、改为按需物化时，虽然删了上层开关，却反手在下层 `samples.py:ensure_sample_revision(sample)` 里新塞入 `*, materialize_records=False, record_histories=None`，在函数内写 `if materialize_records: ensure_sample_records(sample, record_histories=record_histories)`，把“规范化样本 revision”与“物化记录更正历史”两件独立职责硬捆进一个函数，顺带让必填的 `record_histories` 又退化成 `=None` 伪可选。
+- **正确做法**：删开关就是彻底拆开职责——每个纯函数只承担单一职责（`ensure_sample_revision(sample)` 只管 revision，`ensure_sample_records(sample, *, record_histories)` 只管记录历史物化且参数必填），需要同时执行两步的调用方显式组合调用 `ensure_sample_records(ensure_sample_revision(sample), record_histories=...)`，严禁在下层 helper 里复活同义开关。
+
+### 157. 严禁“公开 DTO 出口用外层新字典字面量伪装隔离、内层字段仍直挂全局缓存可变子对象，或修漏拷时往内部调用入口瞎拷”（Outer Dict Literal Masking Nested Cached Mutable References & Misplacing DTO Copy at Internal Entry）
+> 母题：H 缓存失效 · M 无用拷贝与往返转换
+
+- **典型坏习惯**：
+  - 在公开 DTO 出口构造返回字典时，外层写了新字面量 `source = {"base": saved["base"], "base_identity": saved["base_identity"], "baseline": saved["baseline"], ...}` 或浅拷贝 `dict(window)`，看似新建了字典，但内层挂载的 `base_identity`、`source_ref`、`issues` 等子字典/子列表仍直接指向 `_SCENARIO_RECORD_CACHE` 或 `_SAVED_DRAFT_CACHE` 全局缓存；
+  - 发现公开出口漏拷后，不去公开 DTO 组装出口隔离，反而跑到内部计算入口（如 `simulation/projection.py` 调 `simulation_capacity` 前）提前 `clone_json`，导致不输出该公开字段的内部链路也跟着白白深拷贝。
+- **正确做法**：审查公开 DTO 出口时必须逐字段穿透核对所有挂载自全局缓存的嵌套可变容器；隔离拷贝唯一且精确地放在公开 DTO 组装出口（如 `public_projection`、`public_archived_calendar`、`adoption_history` 的 `source` 字典构造处），内部调用链保持 0 拷贝。
+
+### 158. 严禁“同一事实源的多条加载分支中某分支漏挂派生缓存，被下游 `=None` 静默重算兜底完美掩盖性能退化”（Split-Path Cache Population Omission Masked by Downstream `=None` Recompute Fallback）
+> 母题：G 重复计算 · H 缓存失效 · A 死分支、死参数、伪可选
+
+- **典型坏习惯**：
+  - `DecisionSource` 在 `selected_groups` 分支加载基准任务时将 `task_intervals` 挂入 `self._task_intervals["reference"]`，而在 `full_candidate` 分支（`official_details`）加载出同构的 `details["task_intervals"]` 时漏写了挂载语句；
+  - 下游消费函数（`project_decision_delivery(..., intervals=None)`、`project_official_core_metrics(..., task_intervals=None)`、`scoped_rows(..., task_intervals=None)`）又恰好都写了 `if intervals is None: 重新调 task_interval(row) 解析时间字符串` 的兜底——结果上游漏挂缓存 + 漏传参被下游重算兜底静默吞掉，测试全绿但全量视图每次都把数千条任务的时间字符串重解析一遍。
+- **正确做法**：同一事实源对象的所有加载分支必须在数据就绪点原子挂载同一套派生索引；下游消费函数一律删掉 `=None` 重算兜底改为必填关键字参数，让任何分支漏挂或漏传当场暴露错误。
+
+### 159. 严禁“构造函数同时接收聚合对象 `parent` 与其子属性 `parent.child`，再写 `if self._parent.child is not self._child` 自检证明两者是同一个”（Passing Both Parent and `parent.child` Only to Assert Identity Equality）
+> 母题：F 重复校验 · A 死分支、死参数、伪可选
+
+- **典型坏习惯**：
+  - `GraphPriorityPruning.for_cache(cache, graph_state)` 作为全仓唯一构造入口，同时把 `preparation=cache.preparation` 与 `calendar=cache._timing.calendar`（构造期恒为 `preparation.calendar`）拆成两个可选参数传给 `__init__`，随后在 `_certified_external` 里写 `if self._preparation is None or self._preparation.calendar is not self._calendar: return False`——自己把父对象和子属性拆成两份传进去，再写分支怀疑两者不是同一个对象。
+- **正确做法**：已传入聚合上下文对象（`preparation`）时，直接通过 `self._preparation.calendar` 访问子属性，删掉拆出来的平级伴生参数与身份一致性自检。
+
+### 160. 严禁“只读查询方法在外层已开启 `read_snapshot` 事务下再套内层 `with transaction(conn):` 制造嵌套 `SAVEPOINT`，并把外层刚跑过的范围校验再跑一遍”（Read-Only Helper Opening Nested `SAVEPOINT` Inside Caller Read Snapshot & Re-Validating Range）
+> 母题：N 事务、锁与状态生命周期 · F 重复校验
+
+- **典型坏习惯**：
+  - 日历查询与文件导出（`resource/calendars.py`、`worker_calendars.py`、`calendar_files/files.py`、`worker_files.py`）在外层入口已开启 `with self.read_snapshot():` 并完成 `check_range(start_date, end_date)` 的情况下，内层只读辅助函数为了“防别人没开事务直接调我”，又套一层 `with transaction(self.conn):`（在 SQLite 只读事务里平白制造嵌套 `SAVEPOINT` / `RELEASE`），且进门把 `check_range` 再跑第二遍。
+- **正确做法**：只读内部方法共享调用方已开启的 `read_snapshot()` 只读事务，严禁在只读路径上层层套 `with transaction(conn):` 开嵌套 `SAVEPOINT`；参数范围校验只在外层入口执行一次。
+
+### 161. 严禁“跨页状态存储在 `read()` 纯读入口暗藏锁外写盘/补刷（`setItem`/`removeItem`），或在 CAS 读盘失败暂存 `slot.pending` 时丢弃前置附属写入回调 `beforeWrite`”（Unlocked Lazy Flush Inside `read()` Clobbering Cross-Tab Writes & Dropping `beforeWrite` on Deferred Pending Settlement）
+> 母题：N 事务、锁与状态生命周期 · J 口径没在源头统一
+
+- **典型坏习惯**：
+  - 前端 `transport.js:pendingStore` 的状态转换通过 `T.exclusive`（Web Locks）跨页串行，但为了“顺手把上次写盘失败的内存态补刷进磁盘”，在锁外同步调用的 `read()` 里看到 `slot.pending` 就直接调用 `put(target, current)`（`setItem`/`removeItem`）；双页面并发交错时，旧页面在锁外调 `read()` 读完旧值后被切走，新页面持锁完成旧任务结算并写入新 `PENDING_KEY`，旧页面恢复后执行 `removeItem` 直接在锁外把新页面的活跃记录删掉；
+  - 在 `pendingStore.save(null, intent, beforeWrite)`（如 `RunJobAPI.finish` 先写 `RECENT_KEY` 再删 `PENDING_KEY`）中，当 `getItem` 暂时失败记入 `slot.pending` 时，只存了 `{ disk, value }` 却丢掉了 `beforeWrite`，或只在单处重放而漏掉同页幂等重写与新转换顶替分支，导致存储恢复后 `PENDING_KEY` 被删除但 `RECENT_KEY` 永久漏写。
+- **正确做法**：严格切分**纯读**与**持锁写/刷盘**——`read()` 永远只读不写盘（本页存在仍有效的未刷盘记录时仅抛出带 `{ saved: current }` 载荷的写/删异常）；落盘补刷独立为必须在 `T.exclusive` 跨页锁内调用的 `flush()`；带前置附属写入的结算转换暂存进 `slot.pending` 时必须完整携带 `beforeWrite`，并在全部消费出口（`flush`、发起方幂等重写、同页新转换顶替）写主键前统一执行一次并立即将 `beforeWrite` 置空。
+
+### 162. 严禁“异步轮询在 `readSuspended` 暂停窗口期晚到冲掉用户脏草稿，或本机清理失败后把已确认终态仅存在组件局部 `useState` 导致重挂载后复活无效轮询”（Late Async Poll Overwriting Dirty Draft During `readSuspended` & Losing Settled Terminal State Across Remounts）
+> 母题：N 事务、锁与状态生命周期 · H 缓存失效
+
+- **典型坏习惯**：
+  - `SystemMaintenanceConfig.jsx` 在进入维护暂停读取（`readSuspended=true`）瞬间，上一轮已在途的 `load()` 请求晚到返回，因未核对最新挂起状态且在更新基线时无条件重置表单草稿，直接把用户已修改的维护配置草稿冲掉；
+  - 服务端已明确返回拒绝或完成终态、但本机 `localStorage.removeItem` 抛错时，仅在组件局部 `useState` 记录终态；组件一旦卸载重挂载，新实例从磁盘读回未删掉的 `PENDING_KEY`，把已终结的操作当成“未决任务”重新发起网络轮询。
+- **正确做法**：异步读取回调落地前必须核对最新挂起守卫与表单脏状态，脏草稿期间只更新底层基线不覆盖用户输入；服务端已确认终态但本机存储未清掉的记录，必须在模块级存储槽位（`slot.pending` / `session`）保持权威终态，跨组件重挂载一致保留终态与存储错误提示、阻断无效网络查询。
+
+### 163. 严禁“对同一解码父代的多个邻域别名重复跑完整拓扑/时间线准备，或在每次 `evaluate()` 解码时对已缓存 `profile` 重复归一化优先级键与预排序、在优化器内部对受控全集字典用 `.get()` 与冗余强转”（Re-Preparing Identical Decoded Parent Across Elite Aliases, Re-Normalizing Cached Profile Keys Per Decode, & Redundant `.get()`/Casts in Optimizer）
+> 母题：G 重复计算 · H 缓存失效 · F 重复校验 · M 无用拷贝与往返转换
+
+- **典型坏习惯**：
+  - `repair.py` 精英池中多个槽位指向同一份解码结果，却按槽位逐次调用 `prepare_repair_parent` 重复构造拓扑序、资源时间线与切换统计；
+  - `PreparedDecisionFeatures.priority_keys_for_profile(profile)` 虽按 `profile` 缓存了原始字典，`SharedDecodeSession._request()` 却在每次 `evaluate()`（同一 `profile` 跨多个分组顺序评估）时重复执行 `graph_priority_key_map` 全量校验与 `graph_priority_preorder` 排序分组；
+  - `iterated_greedy_joint.py`、`iterated_greedy_neighborhoods.py`、`candidates.py`、`shared_decode.py` 对上游已按全节点集 100% 填齐的 `predecessors`/`successors`/`entry_features`/`_base_node_resources` 到处写 `.get(node_id, ...)`，并对本就是 `bool`/`int`/`float`/`str` 的内部受控字段反复套 `int(bool(...))`、`int(size)`、`float(...)`、`str(...)` 及内部区间自检。
+- **正确做法**：同一解码父代的准备产物按解码身份共享复用；`priority_keys_for_profile` 直接缓存已归一化的 `ValidatedGraphPriorityKeys` 及其 `.preorder`，`SharedDecodeSession` 命中即直接复用；优化器内部受控全集字典一律用 `[]` 直接索引，删光对内部强类型字段的无脑强转与自检。
+
+### 164. 严禁“同一看板/对比快照内对同一批停用区间或基线分段重复解析 2~4 遍，或在带 `LIMIT` 的捕获 SQL 上做跨全表无索引多列排序触发临时 B-tree”（Parsing Identical Outages/Segments Multiple Times Per Snapshot & Triggering SQLite Temp B-Tree Sort Before `LIMIT`）
+> 母题：G 重复计算 · E 先算后扔 · J 口径没在源头统一
+
+- **典型坏习惯**：
+  - 一次方案日历与占用投影中，`ArchivedCalendar._OutageIndex` 与 `TaskConstraints._check_outage` 消费同一份 `sources["outages"]`，却各自写一套循环解析 `instant(start_time)` / `instant(end_time)`、各自判断 `status != "active"` 并各自构造 `IntervalIndex`；候选基线对比在启用时间范围筛选时，先在 `_raw_in_time` 里调一遍 `admission.segments(ref)`，几行后的 `_comparison_row` 又对同一批 `ref` 再调一遍 `admission.segments(ref)`，且同文件内 `_in_time` 与 `_raw_in_time` 把同一套区间重叠判定重复写两遍；
+  - `dashboard_source_repo.py:outage_capture` 在 `LIMIT 50001` 的捕获 SQL 上写 `ORDER BY ro.resource_id, ro.start_time, ro.end_time, ro.id LIMIT ?`，导致 SQLite 在截断前对整张 `ResourceOutages` 表建临时 B-tree（`USE TEMP B-TREE FOR RIGHT PART OF ORDER BY`），取出后又在 Python 里按 `rowid` 二次排序。
+- **正确做法**：同一快照内的停用区间统一由共享的 `OutageIndex` 解析并归并一次，同时供 `ArchivedCalendar` 与 `TaskConstraints` 消费；`admission.segments(ref)` 在分组筛选后算一次并显式下传给范围筛选与行组装，同文件的区间重叠判定收口为单一核心函数；带容量上限的捕获 SQL 用 `ORDER BY rowid LIMIT ?` 保持纯表扫描（`SCAN`），仅在内存按资源分组时用遵循 SQLite 存储类顺序的全序键对准入行排序一次。
+
+### 165. 严禁“路由层已校验的请求在模型层与服务层连跑 2~3 遍同款校验，或删掉内层重复校验后把沦为死参数的 `query`/`size`/`reader=None` 与空转函数留在调用链上”（Validating Facet/Target-Ref Requests 2–3x Across Layers & Leaving Dead Pass-Through Parameters After Cleanup）
+> 母题：F 重复校验 · A 死分支、死参数、伪可选 · C 清理不彻底 · B 多余的层
+
+- **典型坏习惯**：
+  - 列筛选请求在路由入口（`resource_table_queries.py`、`route_table_reads.py`）已调过 `validate_facet_request` / `validate_route_facet_request`，进 `route_facet_scope` 又验第 2 遍，进 `ResourceTableIndex.facets` / `facet_selection` 与 `RouteTableIndex.facets` / `facet_selection` 再验第 3 遍；而内层 `facets` 的 `query` 参数及两处 `facet_selection` 的 `query`/`size` 参数除了传给这行重复校验外全函数根本不用；
+  - `RouteFileService._prepare_import` 先手写一遍 48 位 hex `target_ref` 校验，紧接着调 `reader.resolve(target_ref)` 又把同款 48 位 hex 校验跑第 2 遍，且构造函数挂着全仓 0 传参的 `reader=None` 死参数与死比较；目录导出路由调完 `scope_input(body)`（内部已构造 `CatalogPageRequest`）后，下一行又在 `_selection` 里用同一字典构造第二遍 `CatalogPageRequest`；
+  - `resolve_existing_plan` 内部已调 `get_plan_time_span` 校验过全部任务时间，外层 `plan_catalog.py` 与 `point_query.py` 紧接着又调一遍空转的 `validate_detail_times(resolution)`；前端 `AdoptionState.js` 对已校验受控对象在 `submit`、`begin`、`adopt`、`receipt` 四处连环重跑 `A.overview` 与 `A.input`。
+- **正确做法**：请求校验严格归属唯一的入口边界（路由层或服务构造入口），内部拆出不带校验的纯投影函数直接复用；删掉内层重复校验时，必须顺着调用链把只服务于该校验的死参数（`query`、`size`、`reader=None`）与空转包装函数（`validate_detail_times`）一并连根拔除。
+
+### 166. 严禁“直接原地 `.update` 模块级常量字典造成跨请求全局污染，或用动态新建 SQLite 内存表 + `sqlite_master` 探测充当进程内缓存、删反射探测时靠复制模块或挂冗余闭包守卫树续命”（Mutating Module-Level Constant Dicts In-Place, Abusing In-Memory SQLite Tables as Process Cache, & Duplicating Modules/Callback Trees When Removing `getattr`）
+> 母题：I 偷偷传状态 · G 重复计算 · L 删旧壳时搬家兜底 · F 重复校验
+
+- **典型坏习惯**：
+  - `history/queries.py` 从模块级 `METRIC_CATALOG` 字典取出条目后直接原地 `.update(...)` 混入当次请求数据，把全局只读目录变成了跨请求共享的可变状态；
+  - `source_revisions.py` 为在单次读取内缓存几行版本号，不在 Python 仓储/服务实例上存属性，反而在业务层手写 DDL 创建 `temp.SourceRevisionCache` 临时表、每次查询先查 `sqlite_master` 探测表是否存在；
+  - 被要求删掉日历热路径的 `getattr(calendar, "certified_slot_window", None)` 反射探测时，不直接用类型注册表 `isinstance(calendar, _NATIVE_CALENDAR_TYPES)`，反而新建 `native_timing.py` 复制 `engine.py` 的窗口计算逻辑，并在 `calendar_timing_memo.py` 维护 `_GUARDS`/`_CALENDAR_DAY_GUARDS` 双字典与 `make_lineage_timing_guard` 闭包树，还在 `busy_block_skip.py` 每跳对自产二元组做 `type(window) is not tuple` 与 `_native_indexes(segment_groups)` 事后自检。
+- **正确做法**：模块级常量目录一律只读（消费处构造新字典），严禁原地修改；请求/快照内缓存直接保存在受控 Python 对象属性中，严禁在服务层偷写 SQL 建临时表当缓存；协议能力分派直接使用受控类型元组 `isinstance(calendar, _NATIVE_CALENDAR_TYPES)`，彻底删除复制出来的旁路模块、守卫闭包树与热路径事后类型自检。
+
+### 167. 严禁“把已解析的强类型领域对象 `.to_dict()` 降级塞进保护字典，下游再从该字典把时间字符串重新 `fromisoformat` 解析一遍，或把单值校验函数包装成 `(val,)` 单元素集合接口”（Typed-to-Dict-to-Typed Boomerang via Protection Payload & Single-Value Tuple-Set Wrapping）
+> 母题：M 无用拷贝与往返转换 · G 重复计算 · B 多余的层 · C 清理不彻底
+
+- **典型坏习惯**：
+  - `execution_ledger_adapter.py` 在 `adapt_ledger_facts` 中明明已持有完成 `datetime` 解析的 `ExecutionProjection`（且同层 `ledger_fact_changes` 已算出 `record_segments(projection)` 与资源编码映射），却专门调 `_snapshot_projection(projection)` 将其 `.to_dict()` 转回字符串字典塞进 `ExecutionFact.execution_protection_content`（顺带挂上全仓 0 消费的 `scope_task["plan_ref"]` 死键）；下游守卫与候选提交调 `fact_resource_segments(fact)` 时，又从该字典掏出 `records` 调 `positive_record_segments(execution_record_spans(projection))` 把 ISO 字符串重新解析回 `datetime`；
+  - 同模块的 `_resource_id(refs, resources, kind, reasons)` 把入参做成序列再 `refs = set(refs); if None in refs or len(refs) != 1`，而全仓所有调用点传的都是单元素元组 `(ref,)` 或空元组 `()`。
+- **正确做法**：上游已完成解析的强类型分段与资源编码直接在源头组装为 `ExecutionFact.execution_resource_segments` 不可变元组供下游直接消费，连根删除 `.to_dict()` 保护字典旁路、二次时间解析函数与伴生死字段；只校验单个引用值的内部函数直接接收标量 `ref: Optional[str]`，严禁套 `(ref,)` 单元素元组再转 `set` 假装支持多值。
+
+### 168. 严禁“把共用的实体身份有效性校验（`not in ids`）藏进只处理‘已完成分段’的下游映射 helper，导致‘进行中记录’引用已停用资源时静默漏检”（Hiding Shared Identity Validation Inside a Sub-State Helper Instead of the Root Fact Loop）
+> 母题：J 口径没在源头统一 · O 语义走样 · K 吞错与静默降级
+
+- **典型坏习惯**：
+  - `simulation/constraints.py` 在扫描执行占用时，把 `resource is None` 放在总循环 `_execution_occupancy`，却把 `(kind, ref) not in ids`（永久资源身份已停用/失效）放在只对 `complete` 状态正时长段调用的 `_identified()` 映射函数里；
+  - 结果同一条引用已停用资源的遗留执行记录，在任务 `complete` 时能报错阻断，在任务处于 `started`/`partial`（进行中）或非正时长段时却因不经过 `_identified()` 而直接将已停用的 `ref` 塞进 `release[kind, resource]` 静默放行（返回 `valid=True, issues=[]`）。
+- **正确做法**：凡跨状态共用的基础身份有效性校验（如执行记录引用的永久资源 `ref` 是否仍在当前有效 `ids` 中），必须在遍历全部记录的源头循环（`_execution_occupancy`）中统一执行一次，下游分段映射函数只做纯映射、不再重复校验或按子状态分叉。
+
+### 169. 严禁“文件预检跨请求缓存未来得及落库的瞬时大对象（确认时又得在写事务内重算），或把未准入台账的静默排序/修补混进普通只读加载入口”（Caching Heavy Transient Proposals Across Preview/Confirm Requests & Hiding Silent Canonicalization Inside Read-Only Loaders）
+> 母题：E 先算后扔 · N 事务、锁与状态生命周期 · J 口径没在源头统一
+
+- **典型坏习惯**：
+  - 导入预检（`preview`）把整份解析出的 `changes`/`calendars` 大对象塞进跨请求内存缓存，但确认导入（`confirm`）为了保证写事务隔离与当前事实一致性，本就必须在写事务内基于 `source_content` 重建提案并做单次 `check_current` 比对，导致预检缓存的大对象沦为冗余内存负担与跨请求共享可变引用隐患；同理，已知总行数的物化导出不在拿到 `len(rows)` 时立即检查 `MAX_EXPORT_ROWS` 早退，而是等跑完重型投影和编码才报错；
+  - 质量台账普通只读加载入口 `load_debt_ledger()` 在读取时顺手对未排序条目和缺失自动字段做静默排序与补齐，导致 `check` 门禁读到的是被加载器偷偷修好后的内存态，掩盖了磁盘台账文件本身的失步。
+- **正确做法**：跨请求预检只留存不可变的 `source_content`、轻量摘要与 `expected_revisions`，确认阶段在唯一写事务内重建提案并原子提交；物化导出在获知准确行数的第一时间做容量上限早退；严格分离“已准入只读消费入口（原样校验、失步即报错）”与“未准入刷新入口（排序并重算自动字段）”。
+
+### 170. 严禁“在数据转换入口用正向白名单 `isinstance` + `else None` 把非预期类型的脏数据静默洗白成合法空值，绕过下游准入校验”（Silently Sanitizing Unexpected Dirty Types to `None` via Whitelist `isinstance` Fallback）
+> 母题：K 吞错与静默降级 · O 语义走样
+
+- **典型坏习惯**：
+  - 在数据准入与转换入口（如 `snapshot_capture.py::business_table`），为了防 `None` 或空字符串转日期报错，写成 `convert(...) if isinstance(value, (str, bytes)) and value else None`；
+  - 表面上防住了空值，实质上用窄类型的“正向白名单”把所有非预期类型（如 SQLite 动态类型特性下误存的整型日期 `20261015`、浮点数或异常对象）一股脑 `else None` 吞成了合法空值（“未指定日期”），导致下游准入校验（如 `if row[key] is not None: stored_date(...)`）被静默绕过，把非法的脏数据洗白成看似合法的缺省值存入数据库。
+- **正确做法**：数据转换入口只针对真实的空值表示（`None`、`""`、`b""`）安全短路返回 `None`；对于其他任何非空且非预期的脏类型与非法数据，严禁通过 `isinstance` 白名单 `else None` 静默降级，必须原样传给下游领域解析与校验函数，让非预期数据在真正的信任边界硬拒绝（Fail-Closed），抛出明确的准入校验异常（如 `invalid_order_date`）。
+
+### 171. 严禁“测试夹具关闭类型转换器、生产连接开启类型转换器制造口径分裂，并在业务层散落手写 `isinstance` 兼容补丁苟延残喘”（Fixture vs Production Decltypes Split & Peppered Business-Layer `isinstance` Patches）
+> 母题：J 口径没在源头统一 · D 靠测试续命
+
+- **典型坏习惯**：
+  - 生产环境数据库连接（`core/infrastructure/database.py::get_connection`）开启了 `detect_types=PARSE_DECLTYPES | PARSE_COLNAMES`（将 SQLite `DATE` 列自动反序列化为 `datetime.date` 对象），而单元测试夹具（`tests/conftest.py::schema_conn`）却未开启该选项（始终返回原始 `str`）；
+  - 导致下游业务代码在跑测试时全是 `str` 一路绿灯，在生产连接上却因收到 `date` 对象而将合法数据判定为 `409 constraint_conflict`，或将未变更的日期误判为 dirty；开发人员不修底层连接类型契约，反而在全仓多处业务层（如 `orders/service.py`、`quantity_split.py`）散落手写 `isinstance(..., (date, str))` 的类型兼容补丁，形成“测试靠单一口径续命、生产靠散装防御苟延残喘”的分裂局面。
+- **正确做法**：数据存储与读取的类型表示必须在仓储读取源头单一收口。若需绕过 SQLite 声明类型转换器以获取底层原始字符串，在 SQL 投影源头统一使用表达式（如 `+"col" AS "col"`）规避 `PARSE_DECLTYPES`，确保仓储层输出的类型表示始终单一且确定；同时保证端到端测试与集成测试必须覆盖真实的生产连接配置，严禁上下游测试与生产各用一套连接行为并在业务层靠散装 `isinstance` 抹平。
+
+### 172. 严禁“外部输入只做表层字符检查便甩给标准库宽松解析器，制造跨 Python 版本行为分裂与超长输入 500 崩溃”（Shallow Character Validation Delegated to Loose Stdlib Parsers Causing Version Drift & 500 on Oversized Inputs）
+> 母题：J 口径没在源头统一 · K 吞错与静默降级
+
+- **典型坏习惯**：
+  - 外部输入解析处只用简单的字符集检查（如正则 `\d{2}:\d{2}`、`s.isdigit()`）做表层兜底，随后便放任交给 Python 标准库函数（`datetime.fromisoformat`、`int(s)`）解析，缺乏对真实值域与长度边界的精准约束；
+  - 由于标准库解析器在不同 Python 版本间存在行为演进（如 Python 3.14 扩展了 `fromisoformat` 支持 `24:00` 滚动到次日，而 Python 3.8 会直接抛出 `ValueError`），导致同一输入在不同运行环境下准入行为分裂；又如 Python 3.11+ 引入了整数全局字符串长度上限（`int_max_str_digits` 默认为 4300 位），超长数字字符串虽然能通过 `.isdigit()`，但在 `int()` 时直接引发内部未捕获的 `ValueError` 导致请求 500 崩溃，而非标准的 `400 BadRequest`。
+- **正确做法**：外部不可信边界的解析校验必须精准约束其真实值域，不能把语义准入偷懒甩给标准库解析器。对时间字符串，在入口正则中严格限定真实值域（小时 `(?:[01][0-9]|2[0-3])`，分钟与秒 `[0-5][0-9]`，拒绝跨版本的 24 点滚动）；对整数文本，在转 `int()` 之前必须先行核验字符串长度上限，超出合理业务长度即刻返回结构化 400 校验错误，严禁让标准库异常炸穿为 500。
+
+### 173. 严禁“在读模型构建入口塞 `@lru_cache` 跑 `encode(decode(raw))` 做格式自洁，反手打穿上游原始文本缓存键”（Running `encode(decode(raw))` "Canonicalization" Inside Read-Model Factories & Busting Upstream Cache Keys）
+> 母题：M 无用拷贝与往返转换 · H 缓存失效
+
+- **典型坏习惯**：
+  - 在 `WorkCalendar.from_row` 等只读数据对象的反序列化构建入口中，为了所谓的“保证输出规范（canonical）”，挂上模块级 `@lru_cache` 跑 `encode_periods(decode_periods(stored_json))` 做往返“自洁”；
+  - 殊不知上游捕获与数据导入层早已基于原始数据库文本建立了缓存（如 `capture.decoded_periods` 的键为原始字符串），而 `encode_periods` 重新序列化出来的规范 JSON 文本与原始文本在键序或微小空白上存在微弱差异，导致下游计算引擎在消费该读模型时，拿重编码后的字符串去查上游缓存时 100% 缓存未命中（Cache Miss），反逼下游引擎把同一段 JSON 重新反序列化第 3 遍，既白白浪费往返编解码 CPU，又把上游精心建立的高频缓存直接击穿。
+- **正确做法**：只读模型（Read Model）原样保留底层存储的原始文本，严禁在构建阶段自作聪明做 `encode(decode(x))` 往返重整；反序列化结果的解码与缓存收敛到唯一的权威网关（如 `CalendarEngine.decoded_periods_for_json`），以底层原始存储文本作为唯一缓存键，上游与下游共用同一解析结果。
+
+### 174. 严禁“为获取单个标量字段调用整对象浅拷贝工厂再随手丢弃，并用 Mock 断言内部拷贝次数反向锁死死代码”（Calling Heavy Object-Copy Factory for a Single Scalar Field & Locking In Useless Copies with Mock Call Counts）
+> 母题：M 无用拷贝与往返转换 · E 先算后扔 · D 靠测试续命
+
+- **典型坏习惯**：
+  - 在依赖图构图与耗时计算热路径中，调用方仅仅需要获得节点的实际计件数量（单件模式为 `1`，整组模式为 `group.quantity`）。为了偷懒复用已有节点分组校验逻辑，调用方直接调用 `node_group(node, group).quantity`；
+  - 该工厂函数内部完整执行了包含 12 个字段的 `TaskGroup` dataclass 浅拷贝与重新装配，调用方拿到新对象后却只取其 `.quantity` 标量，随即将其作为垃圾丢弃；更恶劣的是，单元测试中还专门写了 `assert mock_copy.call_count == 1`，将这一处无用的对象浅拷贝锁死成必须发生的操作，导致重构优化时无法直接剔除该拷贝。
+- **正确做法**：将标量计算/校验函数与重型对象复制工厂解耦，分别提供轻量的标量派生函数（如 `node_quantity(node, group) -> int`）与真正需要派生对象的工厂函数（如 `node_group(...) -> TaskGroup`）；只关心标量的构图与耗时计算直接调用标量函数，零对象拷贝；测试断言领域计算结果，严禁断言无意义的内部拷贝次数。
+
+### 175. 严禁“表单下拉框用静态 `index === 0` 焊死 `disabled` 防用户选错，在删掉首行后把用户唯一纠偏出口锁死成死胡同”（Hardcoding UI Dropdowns to `disabled` via Static `index === 0` & Trapping Users in Uncorrectable Errors After Row Deletion）
+> 母题：N 事务、锁与状态生命周期 · F 重复校验
+
+- **典型坏习惯**：
+  - 前端工作时段配置表单为了防止用户把第一个时段设为“次日开始”，在下拉框上写了 `<select value={row.day_offset} disabled={disabled || index === 0}>`；
+  - 该防御假设首行必然合法，然而当用户配置了两个时段（时段 1 为当天 0，时段 2 为次日 1）并点击删除时段 1 后，时段 2 被提升为首行（`index === 0`），此时其 `day_offset` 仍为 `1`；提交校验器严格报错拦截（“首个时段必须在当天开始”），但界面上的下拉框却因为 `index === 0` 被静态焊死为 `disabled`，导致用户无法手动将其改回 `0`，陷入“后端报错不让存、前端禁用不让改”的死胡同，只能将整行删除重填。
+- **正确做法**：界面交互层的防御性禁用必须校验当前值是否已经处于受保护的合法终态（例如 `disabled || (index === 0 && row.day_offset === 0)`）；若首行因前序操作（如删除、导入、复制）意外处于非法状态（`row.day_offset !== 0`），界面必须允许用户交互纠偏，绝不能用静态序号把用户唯一的纠正出口锁死。
+
+### 176. 严禁“为防局部比值公式除零，在特征源头把合法 `0.0` 篡改成 `epsilon`（`1e-6`），连坐污染所有不做除法的排序与拓扑传播”（Epsilon-Poisoning Zero-Duration Truth at the Source to Dodge Downstream Division-by-Zero）
+> 母题：O 语义走样 · C 清理不彻底
+
+- **典型坏习惯**：
+  - 入口准入与正式解码均承认总时长 `0.0`（零时长点事件节点）是合法事实，只有下游两个比值公式（`_saveability` 与 `_critical_ratio`）需要处理分母 `remaining_hours == 0`；
+  - 编码者不在那两个比值公式处定义零剩余时长的业务边界，反而在共同特征准备源头（`v2_features.py`）把所有 `total <= 0.0` 强行改写成 `_ZERO_TOTAL_DURATION_EPSILON_HOURS = 1e-6`（3.6 毫秒）并配上一套告警日志与 `_positive_float` 兜底，结果导致所有根本不做除法的下游——最短处理时间排序（`0.0` 被排在 `1e-7` 真实微秒节点之后，次序反转）、加权时长、工作桶聚合与后继节点最早释放时间传播（无中生有推迟 3.6ms）全被假 `epsilon` 污染。
+- **正确做法**：特征准备层 100% 保真传递上游准入后的 `0.0` 时长，删掉 `epsilon` 常量、追踪日志与伪正数兜底；零分母语义唯一且精确地收口在实际做除法的比值公式内（如正截止时间预算下零剩余时长直接返回满可救度 `1.0` 与正向极值）。
+
+### 177. 严禁“把公开展示值（已舍入 `float` 或前端保精度大整数 `str`）回流充当内部计算/排序输入，或用有限位 `Decimal` 比较循环小数阈值”（Public Display Representation Boomeranging into Internal Math/Sorting & Finite-Precision `Decimal` Truncation on Repeating Fractions）
+> 母题：J 口径没在源头统一 · M 无用拷贝与往返转换 · O 语义走样
+
+- **典型坏习惯**：
+  - **已舍入展示值回流内部聚合**：指标校准样本层算完单位耗时后四舍五入成 3 位 `float` 放入公开样本字典，下游汇总层（`method.py`）不消费原精确比率，反而从公开字典把已舍入的数值回流重算中位数并塞进私有键 `_raw_suggested_unit_hours` 偷渡；且若只用 28 位有限精度 `Decimal` 计算 `1/3`、`1/6`、`1/7` 等无限循环小数，在 `> 20%` 离散度严格比较时会因第 28 位截断产生 `1e-28` 伪差值，将恰好处于 `20%` 边界的合法样本误判剔除；
+  - **前端保精度文本回流后端排序**：为防止浏览器 JS `Number` 超过 $2^{53}-1$ 丢失精度，公共投影把超大整数序号转为 `str`（形成 `int | str | None`），后端自己的 6 处步骤排序却直接拿该公开混合字段做 `<` 比较或各写一套局部 `int(x)`，遇到普通 `int` 与大整数 `str` 混排当场抛 `TypeError: '<' not supported between instances of 'str' and 'int'`。
+- **正确做法**：严格隔离**“内部精确计算/排序事实”**与**“公开输出表示”**——内部聚合、中位数与阈值比较全程消费无限精度 `Fraction`（或强类型精确值），仅在最终公开 DTO 出口执行一次 `quantize` 量化或大整数转字符串；对 `int | str | None` 公共字段的排序统一收口到唯一的领域排序键函数（如 `step_sequence_order`）。
+
+### 178. 严禁“上游持有现成因子却只存乘积 `weighted = duration * weight`，逼下游用除法 `weighted / duration` 反推原因子导致零值或同权时失真”（Reverse-Dividing a Product Downstream to Recover an Upstream Factor Instead of Passing It Explicitly）
+> 母题：J 口径没在源头统一 · O 语义走样
+
+- **典型坏习惯**：
+  - 上游特征准备函数明明已算出每个节点的优先级权重 `priority_weight`，却只在字典里保存乘积 `weighted_processing_hours = duration * priority_weight`；
+  - 下游迭代贪婪（`iterated_greedy_screen.py` / `iterated_greedy_joint.py`）需要 `priority_weight` 时，不让上游显式带出该字段，反而写 `weighted_hours / duration if slack_weight != 1.0 else 1.0` 用除法反推——结果一旦遇到零时长节点（`duration == 0`）或配置为 `slack_weight == 1.0`，原本 `2.0`/`4.0` 的高优先级权重当场被洗成 `1.0`。
+- **正确做法**：下游需要的原始因子（如 `priority_weight`）必须由上游在构造特征字典时直接作为显式字段导出，严禁“上游乘完丢因子、下游再用除法反推”。
+
+### 179. 严禁“对整窗与阻塞分段各自提前转 `float` 再相减制造 `+1.11e-16` 幽灵正残差，使 `max(0.0, ...)` 单向夹断放行假正数”（Per-Segment Float Rounding Before Subtraction Creating Ghost Positive Residual Capacity That Escapes `max(0.0, ...)`）
+> 母题：O 语义走样 · M 无用拷贝与往返转换
+
+- **典型坏习惯**：
+  - 计算窗口剩余容量 `window_capacity - sum(blocked_segments)` 时，整窗有效时长转一次 `float`，每段被占用的阻塞区间各自转一次 `float` 累加，最后相减并用 `non_negative_float`（`max(0.0, value)`）夹断；
+  - 当非单位效率（如 `0.7`）的工作窗口被两段阻塞 **100% 完全占满**时，因整窗与各分段转为 IEEE-754 `float` 时的舍入方向不同，相减得出 `+1.11e-16` 小时的**假正剩余容量**；而 `max(0.0, ...)` 只能拦住微负数、拦不住微正数，导致已被 100% 占满的死窗口被下游判定为仍有可用容量。
+- **正确做法**：凡涉及整窗与子分段相减的精确容量/时间扣减，内部全程在整数微秒或精确有理数 `Fraction` 上完成求和与相减（`residual = window_fraction - blocked_fraction`），仅在最终出口转一次 `float`，并删掉掩耳盗铃的 `non_negative_float` 夹断。
+
+### 180. 严禁“删旧兜底时在下层对本文件刚算出的受控有界 `Fraction` 塞入 `isinstance` 与 `except OverflowError` 事后自我怀疑”（Injecting Post-Hoc `isinstance` & `OverflowError` Self-Doubt on Bounded Internal `Fraction` When Removing Legacy Clamps）
+> 母题：L 删旧壳时搬家兜底 · F 重复校验
+
+- **典型坏习惯**：
+  - 被要求删掉 `non_negative_float` 并改为 `Fraction` 精确容量扣减后，编码模型在下层转换辅助函数 `_fraction_to_float(value: Fraction)` 里偷偷塞入 `if not isinstance(value, Fraction): return float(value)` 以及 `try: return float(value) except OverflowError: return ...`；
+  - 而该函数的唯一输入就是上一行刚由日历窗口微秒数（跨度 $\le 30$ 天，分母恒为 $3.6\times 10^9 \times 2^k$）算出的 `Fraction`，在数学与物理上 100% 是 `Fraction` 且绝不可能溢出 IEEE-754 `float` 上限（$\approx 1.8\times 10^{308}$）。
+- **正确做法**：内部受控计算链路上刚产出的强类型有界有理数直接调用 `float(value)`，严禁在删掉旧兜底后又塞入无意义的 `isinstance` 类型自检与不可达的 `OverflowError` 吞错。
+
+### 181. 严禁“生产调用方 100% 显式传 `max_items=None` 绕过上限，仅靠单测手造 `max_items=1` 给死上限分支续命”（Production Callers Always Passing `max_items=None` While Keeping Dead Limit Branch Alive Only via Synthetic Test）
+> 母题：A 死分支、死参数、伪可选 · D 靠测试续命
+
+- **典型坏习惯**：
+  - `run_input_codec.py:prepare_execution_projections` 挂着默认参数 `max_items: Optional[int] = MAX_ITEMS` 并维护一套超限报错分支，表面看似有容量边界保护；
+  - 实则全仓所有生产调用方（`restore_execution_projections`、`candidate_baseline.py`）都显式传入了 `max_items=None`（因为真实条数上限早已在上游 `run_input_rows` 边界校验完毕），唯一传入正整数触发该分支的只有 `test_stored_snapshot_validation.py` 里专门手造的 `max_items=1` 测试。
+- **正确做法**：用 `symbol_locator` 核清参数的真实生产实参；凡全仓生产调用点恒传 `None` 绕过的伪上限参数，连同其死分支与专门手造正整数保活的单测一并彻底删除。
+
+### 182. 严禁“只读准入/校验函数顺手原地改写调用方传入字典的嵌套列表（`row['records'] = ...`），破坏只读契约并逼上游防御性深拷贝”（Read-Only Admission Validator Mutating Caller Input Dicts In-Place）
+> 母题：I 偷偷传状态 · M 无用拷贝与往返转换
+
+- **典型坏习惯**：
+  - `prepare_execution_projections(payload)` 职责是只读校验存储快照的结构合法性，却在遍历校验时顺手执行 `value["records"] = records` 原地替换调用方传入的字典字段；下游 `restore_execution_projections` 又进一步把同一个 `row["records"]` 原地改写成 `ExecutionRecord` 对象列表，导致调用方为了保护原快照字典不被校验器篡改，被迫在进门前全树复制。
+- **正确做法**：只读准入与校验函数必须保持 100% 纯只读（0 原地改写、0 防御拷贝）；需要恢复为领域对象实例时，在对象构造出口（`restore_execution_projections`）新建外层对象与子列表，绝不回写准入输入字典。
+
+### 183. 严禁“区间交集查询用单调前缀 `prefix_max_ends` 伪二分替代全扫，一旦早期存在一条长包含区间即退化回 100% 线性全扫”（Prefix-Max-End Binary Search Degrading to Full Linear Scan Under Long Enclosing Intervals）
+> 母题：G 重复计算 · E 先算后扔
+
+- **典型坏习惯**：
+  - 为优化 `T` 个任务与 `D` 条停用窗口的区间重叠枚举（`start < high and end > low`），将窗口按 `start` 升序排列后维护单调递增的前缀最大终点 `prefix_max_ends`，查询时用 `hi = bisect_left(starts, high)` 和 `lo = bisect_right(prefix_max_ends, low, 0, hi)` 截取 `ordered[lo:hi]`；
+  - 该写法在短小不相交区间下看似 $O(\log D)$，但只要资源在时间轴早期存在一条跨周/跨月的长包含停用窗口 `[t0, t_far)`，其后所有短窗口的 `prefix_max_ends[i]` 都会被锁死为 `t_far`，导致 `bisect_right` 恒返回 `lo = 0`，瞬间退化回每次线性扫描 `[0..hi)` 的全部历史短窗口（1,000 个任务 × 5,000 条停用窗口实际仅 2,000 个交集，却扫描了 450 万次窗口）。
+- **正确做法**：对允许任意嵌套/包含的区间集合做交集枚举时，必须使用真正对包含关系免疫的索引结构（如**静态中点区间树 Centered Interval Tree**：节点按中点 `center` 划分纯左子树 `end <= center`、纯右子树 `start > center`，跨中点区间同时保存按 `start` 升序与按 `end` 升序两份列表配合 `bisect` 切片），确保每次查询只访问 $O(\log D + K)$ 个真实命中项，无效候选窗口扫描为 0。
+
+### 184. 严禁“继承内置 `dict` 覆写 `__getitem__`，在下游读字典键时偷偷跑 SQL 查库并原地改写自身”（Subtyping `dict.__getitem__` to Run Hidden Lazy SQL Queries & Mutate Self on Key Lookup）
+> 母题：I 偷偷传状态 · G 重复计算
+
+- **典型坏习惯**：
+  - `routing/queries.py::_RawRouteFacts(dict)` 继承内置 `dict` 并覆写 `__getitem__`，表面作为普通数据字典传给下游只读投影函数，实则一旦下游访问 `facts["references"]` 或 `facts["identities"]`，就在字典索引背后偷偷调用 `self._repo.catalog_references()` 执行 SQL 查询并 `super().__setitem__(...)` 原地改写字典自身；
+  - 把数据库 I/O 伪装成纯内存字典读取，导致事务生命周期与 SQL 调用点完全隐形（一旦在事务外读取字典键就会意外触发游离 SQL）。
+- **正确做法**：纯数据容器与数据库查询严格分离；按需读取必须由显式的事实作用域（Fact Scope）方法在受控读事务内完成，严禁继承 `dict`/`list` 在 `__getitem__` 中暗藏数据库查询副作用。
+
+### 185. 严禁“公开 DTO 投影函数顺手 `.pop()` 删掉内部评估字段，毁掉上游产物逼同事务后续步骤推倒重算”（Public DTO Projection In-Place `.pop()`-ing Internal Fields & Forcing Same-Transaction Re-computation）
+> 母题：I 偷偷传状态 · E 先算后扔 · G 重复计算
+
+- **典型坏习惯**：
+  - `preflight_result.py::summarize` 在把内部节点评估行组装成公开预检 DTO 时，为了不向前端暴露内部字段，直接遍历评估行执行 `row.pop("node_id", None); row.pop("external_lead_days", None)` 原地删改上游传入的列表元素；
+  - 导致同一个只读事务里紧随其后的任务受理步骤（`jobs.py::_resolve` -> `input_admission.py`）因评估行里的 `node_id` 和外部周期已被毁掉，无法复用预检结果，被迫把执行投影、合并周期和节点分类从头重算第二遍。
+- **正确做法**：内部不可变评估结果与对外公开 DTO 投影严格分离；公开投影出口通过构造新字典选取对外字段，严禁原地 `.pop()` / `del` 破坏上游共享的内部数据结构。
+
+### 186. 严禁“单机前端对自家同进程后端刚返回的受控 DTO 写数千行键数白名单、分页算术重验、主线程万行 diff 重算与 SQL 排序重验，并靠篡改字段测试续命”（Frontend Re-Validating Controlled Backend DTOs with Strict Key-Count Whitelists, Main-Thread Diff Re-computation & SQL Order Checks）
+> 母题：F 重复校验 · J 口径没在源头统一 · D 靠测试续命
+
+- **典型坏习惯**：
+  - 单机离线前端只连接本进程 Python 后端，却在 25 个 `*Contract.js / *API.js` 中写了 ~5,500 行代码把后端受控响应当不可信外部输入防：用 `Reflect.ownKeys(v).length === keys.length` 锁死键数（后端多返一个字段前端即报错崩溃）、在 12 个文件复制粘贴 `Math.ceil(total / page_size)` 重验后端分页、重验 `'正式方案 v' + p.version` 文案拼接、在浏览器主线程遍历 20,000 行重算基线 diff（`PlanContract.js::baselineRows`）并在布尔校验函数里顺手 `row.after = matched` 原地替换入参、用 JS 遍历重验后端 SQLite 的 `ORDER BY` 与 `WHERE` 结果（`RunHistoryAPI.js`），还在 `.cjs` 测试里写上千行 `delete p.data.tasks[0][key]` 篡改断言给这层重复校验续命。
+- **正确做法**：单机前端信任边界只守公共信封、请求/快照身份防串线（`bindResponse`）、用户输入归一化（`input`）与本机存储反序列化（`validIntent`）；紧凑引用展开（如 `{task_ref}` → 任务对象）归位到显式展示模型（如 `PlanTimelineModel`），严禁在前端镜像重写后端业务公式、分页算术、SQL 排序与字段数白名单，同步删除篡改受控 DTO 的续命测试。
+
+### 187. 严禁“不在自有 UI 组件模板源头渲染语义属性，反而在外层用 `useLayoutEffect` + `querySelectorAll` 每帧扫描修补 DOM”（Post-Render `useLayoutEffect` DOM Scraping & Patching Instead of Rendering Semantic Attributes at the Component Source）
+> 母题：J 口径没在源头统一 · B 多余的层
+
+- **典型坏习惯**：
+  - `ReportEvidence.jsx::TableFrame` 因为沿用了从旧原型目录抽出的表格组件，不在 `Table` 组件 JSX 源头渲染 `<caption>`、`<th scope="col">` 和固定列 class，反而在外层包一个容器组件，在每次渲染后的 `React.useLayoutEffect` 里跑 `table.createCaption()`、`table.querySelectorAll('thead th').forEach(...)`、`table.querySelectorAll('tr').forEach(...)` 扫描整张 DOM 表打补丁。
+- **正确做法**：自有组件需要什么无障碍属性、表头 `scope` 或固定列类名，直接在组件 JSX 模板源头一次性声明式渲染，严禁在下游用 `useLayoutEffect` 遍历 DOM 事后修补。
+
+### 188. 严禁“架构重构未改任何持久化格式，却在规划或代码中预设离线数据库转换器与服务端离线结算浏览器 `localStorage` 的假想工具”（Inventing Imaginary Offline DB Converters & Server-Side `localStorage` Reconcilers When Storage Schema Is Unchanged）
+> 母题：A 死分支、死参数、伪可选 · B 多余的层
+
+- **典型坏习惯**：
+  - 在 `CURRENT_SCHEMA_VERSION`、归档 JSON 与回执表落盘格式 100% 零变更的内部重构中，不先核实存储层是否真有变化，就凭空规划出一套“停机离线数据库转换器”与 `reconcile_frozen_intent` 离线对账工具，甚至企图在服务端离线 Python 脚本里去结算只存在于客户端浏览器 `window.localStorage` 中的未决命令记录。
+- **正确做法**：先核实持久化 Schema 与落盘 JSON 键名是否真有变更；零存储格式变更时严禁捏造迁移/转换工具，未决命令恢复统一走既有的在线回执查询与启动恢复唯一链路。
+
+### 189. 严禁“应用入口模块在 `import` 顶层急切调用 `create_app()`，导致任何脚本/测试导入时隐式连正式库、跑 Schema 校验并注册 `atexit` 钩子”（Eager Top-Level `app = create_app()` on Module Import Triggering Hidden DB Connections, Schema Checks & `atexit` Hooks）
+> 母题：E 先算后扔 · N 事务、锁与状态生命周期
+
+- **典型坏习惯**：
+  - `app.py` 顶层写 `if __name__ not in ("__main__", "__mp_main__"): app = create_app()`，在无任何生产 WSGI 容器消费 `app.app` 的情况下，导致任何执行 `from app import create_app` 的测试或工具在 `import` 阶段就无条件连接默认正式数据库、跑一遍全套 Schema 校验并注册 `atexit` 退出备份钩子，紧接着调用方再调一次 `create_app()`。
+- **正确做法**：应用入口模块只定义工厂函数 `create_app()` 与 `if __name__ == "__main__": main()`，严禁在模块 `import` 顶层执行数据库连接、Schema 校验、写日志或注册进程钩子等运行时副作用。
+
+### 190. 严禁“单机/个人项目无外部公网分发安全需求，却铺设全套 SHA256/SHA512 哈希清单、`--require-hashes` 与 SRI 校验脚本，甚至留下代码早已不读的僵尸哈希字段”（Ceremonial SHA256/SHA512 Checksum Manifests, `--require-hashes` & Unread Zombie Hash Fields in Personal Offline Projects）
+> 母题：A 死分支、死参数、伪可选 · F 重复校验
+
+- **典型坏习惯**：
+  - 在无公网第三方供应链分发要求的单机/个人项目中，往 `offline-manifest.json` 塞入 23 条 `"sha256"` 与 `"published_md5"`（而离线准备脚本实际只核对文件存在性与字节数 `size`，哈希字段彻底沦为 0 读取僵尸字段）、在 `vendor-manifest.json` 残留 8 条无人消费的 `"tarball_sha256"` / `"sha256"`、在 `vendor_react.py` 与 `esbuild-manifest.json` 维护一套 `sha512-` SRI 校验及篡改单测、在本地 `--no-index --find-links` 离线装包中强制挂 22 行 `--hash=sha256:...` 与 `--require-hashes`，甚至在本地 Git hook 缓存键里对受控二进制跑 `hashlib.sha256`。
+- **正确做法**：无明确公网分发安全要求时，严禁生成 `SHA256SUMS`、哈希清单、`--require-hashes` 或配套哈希校验脚本与篡改测试；离线构建材料与本地钩子缓存统一通过包名、精确版本号、文件存在性及 `(size, mtime_ns)` 元数据核验，代码不再读取的历史哈希字段当场清零。
+
+### 191. 严禁“同一业务视图的关联数据脱离主只读快照在事后另开第二次 SQL 查询补抓，既重复查库又破坏同快照时间点一致性”（Out-of-Snapshot Secondary SQL Fetch Breaking Point-in-Time Read Consistency）
+> 母题：G 重复计算 · N 事务、锁与状态生命周期
+
+- **典型坏习惯**：
+  - `PlanReadService` / `ActualTimelineService` 先在主只读事务快照内读取方案与任务行，离开原捕获流程后再单独调用仓储二次查询 `OrderQuantitySplits` 拼装拆分血缘 `split_lineage`；一旦两次查询之间有并发拆分事务提交，同一响应里的任务列表与拆分血缘看到的就不是同一个数据库时间点。
+- **正确做法**：同一只读用例依赖的全部关联表必须在同一个只读事务快照（如 `capture_split_lineage_snapshot`）内一次性完成捕获并随显式事实作用域单向下传，严禁脱离主快照二次补查拼凑。
+
+### 192. 严禁“仅针对勾选的少量实体执行批量预览、删除或选中导出，却无条件加载全库整表快照（`whole_tables`）再在内存里按 `ref` 过滤丢弃”（Loading Full-Database Table Snapshots for Bounded Selected-Entity Previews, Deletes or Exports）
+> 母题：E 先算后扔 · G 重复计算
+
+- **典型坏习惯**：
+  - 用户仅勾选 3 条订单组执行批量删除预览（`bulk-preview`）、确认（`bulk-confirm`）或选中导出（`selected`），后端却走无过滤的 `whole_tables` 把全库数千订单组、数万子任务及全部关联表整表拉进 Python 内存，最后只取勾选的 3 行投影输出、其余 99.9% 数据直接丢弃。
+- **正确做法**：按用途收敛显式事实作用域：列表查询走 SQL 谓词下推（`filtered_order_tables`），按指定 `refs` 的批量预览/提交/选中导出走目标实体关系闭包查询（`entity_closure`），SQL 层只加载目标实体及其关联闭包。
+
+### 193. 严禁“在含 `INTEGER PRIMARY KEY` 的 SQLite 表上写裸 `SELECT rowid` 漏写 `AS rowid` 别名，小数据量走单查分支掩盖缺陷，一过分块阈值即因列名为 `id` 炸穿 `KeyError: 'rowid'`”（Unaliased `SELECT rowid` on SQLite `INTEGER PRIMARY KEY` Tables Crashing with `KeyError` Only Above Chunk Threshold）
+> 母题：O 语义走样 · J 口径没在源头统一
+
+- **典型坏习惯**：
+  - 大参数集分块并集查询（`total_params > QUERY_PARAM_CHUNK(400)`）写 `SELECT rowid FROM "Table" WHERE ...` 并用 `row["rowid"]` 取值；在声明了 `id INTEGER PRIMARY KEY` 的 SQLite 表（如 `ItemStages`、`GroupTasks`、`GroupRequirements`）上，SQLite 将未加 `AS` 别名的 `rowid` 结果列命名为 `"id"` 而非 `"rowid"`，导致常规小样本单测（`<= 400` 参数走直接 `SELECT *` 分支）全绿，一到 5,000 条记录压测跨过 400 参数阈值即抛 `KeyError: 'rowid'` 500 崩溃。
+- **正确做法**：凡按字典键名读取 SQLite `rowid`，投影列必须显式写 `SELECT rowid AS rowid`；含分块阈值的仓储查询必须在单测中调小阈值（如 `QUERY_PARAM_CHUNK = 1`）显式锁住多分块分支。
+
+### 194. 严禁“目录或前端架构迁移后仍保留 `prototype/` 等旧物理目录与搬运脚本充当中转层，而非一次性迁入正式目录并物理删空”（Retaining Legacy `prototype/` Directories & Copy Scripts as Middlemen After Module Migration）
+> 母题：B 多余的层 · C 清理不彻底
+
+- **典型坏习惯**：
+  - 前端已确立 `frontend/app/` 为唯一正式模块树，却只把部分 JSX 引用改掉，仍在仓库保留 `frontend/prototype/`、`static/prototype/` 与 `import_prototype.py` 复制脚本，导致生产样式/字体继续跨目录耦合死原型树，构建与门禁还要持续维护两套资产路径。
+- **正确做法**：将仍被生产使用的样式、字体、图标与许可证 1:1 迁入正式目录（`app/{styles,assets}/`），一次性改齐全部引用后当场物理删除旧源码目录、旧构建输出子目录与搬运脚本。
+
+### 195. 严禁“门禁或缓存指纹用无后缀 `**/*` 通配符把本机未跟踪草稿、`.pyc` 字节码和数十 MB 历史证据目录全量卷入内容比对”（Over-Broad `**/*` Fingerprint Globs Hashing Untracked Scratch Files, `.pyc` Bytecode & Historical Evidence）
+> 母题：E 先算后扔 · H 缓存失效
+
+- **典型坏习惯**：
+  - `quality_gate_shared.py` 配置长门禁输入作用域时随手写 `docs/roadmap/**/*`、`docs/features/**/*`、`skills/**/*`，把本机被 Git 忽略的 600+ 份历史运行证据 JSON 与 `__pycache__/*.pyc` 字节码全部读入内存计算指纹，既拖慢每次评估又让运行副产物频繁打穿缓存。
+- **正确做法**：门禁与缓存作用域通配符必须精确限定到受版本治理且真实决定检查结果的受控子目录与扩展名（如 `*.{md,yaml,py,ps1}`），严禁用无后缀 `**/*` 吞入运行期缓存、字节码与历史证据目录。
+
+### 196. 严禁“外部启动/重跑脚本不复用宿主运行锁协议，健康探测偶发超时即无锁删空存活实例的运行时契约文件”（External Helper Script Deleting Live Runtime Contract Files Unlocked Upon Health-Probe Timeout）
+> 母题：N 事务、锁与状态生命周期 · J 口径没在源头统一
+
+- **典型坏习惯**：
+  - 辅助启动脚本 `run_start_and_rerun.py` 在 `/system/health` 慢响应超时返回 `None` 后，未检查 `app_runtime.lock` 是否仍由存活进程持有，就直接无锁删除 `app_host.txt`、`app_port.txt`、`app_db_path.txt` 与 `app_runtime.json`；结果旧进程仍持有排他运行锁导致新进程 `rc=13` 被拒，旧实例自己也变成丢失定位契约文件的“孤儿进程”。
+- **正确做法**：任何辅助脚本清理运行时状态文件前，必须复用宿主唯一的 `runtime_lock_mutation_guard` + `is_runtime_lock_active` 运行锁协议；检测到活跃或归属不明的运行锁时立即失败退出，绝不无锁删改存活实例契约。
+
+### 197. 严禁“手拼 `f'file:{path.as_posix()}?mode=ro'` 构造 SQLite URI 漏编码 `#`/`?`，导致特殊文件名截断 URI 绕过只读非空库守卫”（Hand-Rolled `file:` SQLite URI Without `Path.as_uri()` Truncating `#`/`?` Paths & Bypassing Read-Only Guard）
+> 母题：O 语义走样
+
+- **典型坏习惯**：
+  - 隔离库只读非空守卫手写 `sqlite3.connect(f"file:{db_path.resolve().as_posix()}?mode=ro", uri=True)`；当 `--db-path` 含 `#`（如 `isolated#prod.db`）或 `?` 时，SQLite URI 解析器把 `#prod.db?mode=ro` 当作 URI fragment 丢弃，转而在磁盘新建/打开空白的 `isolated` 文件并判定为“空库放行”，使非空生产库保护完全失效。
+- **正确做法**：本地文件路径转 `file:` URI 必须调用标准库 `db_path.resolve().as_uri()` 完成百分号编码（`#` → `%23`、`?` → `%3F`），再拼接 `?mode=ro` 查询参数，严禁手工拼接裸路径字符串。
+
+### 198. 严禁“主入口早已退役的数千行独立历史校验大脚本，仅因个别测试顺手 `import` 了其中两三个小辅助函数就整份留在仓库续命”（Keeping a 4,000-Line Retired Verification Script Alive Only Because Two Tests Import Tiny Helpers From It）
+> 母题：C 清理不彻底 · D 靠测试续命
+
+- **典型坏习惯**：
+  - 4,186 行的旧独立命令行校验脚本 `scripts/verify_legacy_portal.py`（含近 200 处 `.get()` 与 60 处防御拷贝）早已退出正式门禁流程，仅因 `tests/portal/` 中两个测试文件顺手 `from scripts.verify_legacy_portal import ...` 引用了 3 个小型导出比对函数，导致整份四千多行的历史包袱长期滞留仓库参与静态维护。
+- **正确做法**：退役历史入口或一次性大脚本时，用 `symbol_locator` / `rg` 查清真实引用；若仅剩个别测试借用少量纯断言 helper，将最小必要断言迁回 `tests/_support/` 后立即整份删除旧脚本。
+
+### 199. 严禁“内部包在无包级状态需求时维护 `__init__.py` 动态 `__getattr__` 重导出桶文件（Barrel File），掩盖真实依赖并制造动态导入豁免债务”（Maintaining Lazy `__getattr__` Barrel `__init__.py` Re-Exporters That Obscure Dependencies & Incur Dynamic-Import Debt）
+> 母题：B 多余的层 · C 清理不彻底
+
+- **典型坏习惯**：
+  - `data/repositories/__init__.py` 用 110 行代码维护 40+ 个仓储类的 `TYPE_CHECKING` 导入表、`_EXPORTS` 字符串映射字典与 `__getattr__` 动态 `import_module` 转发，既让读者看不出真实文件级依赖，又迫使循环依赖门禁专门为其登记 `unresolved_dynamic_imports` 债务。
+- **正确做法**：内部子包禁止充当只做名字转发的重导出桶文件或 `__getattr__` 懒加载器；所有调用方直接显式 `from data.repositories.<concrete_repo> import XxxRepository` 导入真实定义模块。
+
+### 200. 严禁“外层 Python 脚本为下游外部运行时（如 Node `esbuild`）准备平台二进制或缓存身份时，用 Python 自身的 `platform.machine()` 代替目标可执行文件的真实运行架构”（Using Wrapper Python `platform.machine()` Instead of Target Runtime Architecture Under Rosetta/Mixed-Arch Hosts）
+> 母题：J 口径没在源头统一 · O 语义走样
+
+- **典型坏习惯**：
+  - 在 ARM64 Python 与 Rosetta `x64` Node 混用的 macOS 宿主上，真正加载 `@esbuild/<platform>` 二进制的是 Node 进程（按 Node 自身的 `process.platform + '-' + process.arch` 查找 `@esbuild/darwin-x64`），Python 钩子预置逻辑却按 `platform.machine()`（`arm64`）只复制 `@esbuild/darwin-arm64`，导致干净 worktree 内 Node 编译直接报 `MODULE_NOT_FOUND`。
+- **正确做法**：凡为外部可执行运行时准备平台相关依赖或生成缓存键，必须向实际被调用的目标可执行文件探测其运行平台/架构（仅在目标运行时不存在时回退宿主探测），严禁拿外层包装脚本的解释器架构想当然替代。
+
+### 201. 严禁“写入原语藏匿已生成的字段，逼同事务调用方紧接 `SELECT` 写后回读并对刚插入行判空自检”（Write Primitive Hiding Generated Values & Forcing Same-Transaction Refetch）
+> 母题：G 重复计算 · E 先算后扔 · F 重复校验
+
+- **典型坏习惯**：
+  - `persist_official_plan_in_tx` 在写事务内明明已算出 `adopted_at` 时间戳与版本号，返回值却只给 `{"official_plan", "row_count"}`（或让 `created_at` 隐式走 SQLite `CURRENT_TIMESTAMP` 默认值而不交出）；
+  - 结果两个上游提交调用方刚调完写入原语，下一行立刻在同一事务内调 `repo.adopted_plan_times(version)` 发 `SELECT` 把刚插进去的那一行再读回来，甚至对着同事务刚插入的行写 `if row is None: raise ValueError(...)` 自检。
+- **正确做法**：写入原语在内存中统一确定时间戳、版本号与新主键，并将其随定型返回值一次性完整交还调用方；同一写事务内严禁“刚写完立刻 `SELECT` 回读自己刚写下的行”。
+
+### 202. 严禁“生产者写死恒真标记供下游专门自检，或在单机闭合库搞跨表防自家篡改公证审讯”（Hardcoding Constant `True` Flags for Downstream Self-Check & Building Cross-Table Anti-Self-Tampering Notarization Chains）
+> 母题：F 重复校验 · B 多余的层
+
+- **典型坏习惯**：
+  - 全仓仅有的两个数据生产者都硬编码写入常量字段 `rows_complete = True`，下游分析模块却专门写一段 `if not payload.get("rows_complete"): raise ...` 检查自己写死的 `True`；
+  - 在无外部直连改库的单机闭合系统中，额外建跨表引用公证表或 10+ 个公证校验模块，每次分页读取都连坐重验整表 9,999 条兄弟记录来“证明本进程上次事务写进 SQLite 的行没被本进程偷偷改坏”。
+- **正确做法**：删除恒定常量状态位及其配套自检分支；单机闭合存储信任本进程写入事务与启动/恢复期的 Schema 准入校验，严禁在运行期读取路径上建设“自己审讯自己”的伪公证链。
+
+### 203. 严禁“上下游传递未定型裸字典并用 `.get()` 消费，将键名拼写错配静默洗成常年 `None` 假空态”（Consuming Untyped Internal Dicts via `.get()` & Silently Turning Key-Name Mismatches into Constant `None`）
+> 母题：K 吞错与静默降级 · O 语义走样 · J 口径没在源头统一
+
+- **典型坏习惯**：
+  - 上游配置档案模块（`graph_profiles.py`）产出的权重字典键名为 `critical_path`、`successor_count`、`bottleneck_resource`，以未定型的 `Dict[str, Any]` 往下传；
+  - 下游执行器（`candidate_runner.py`）因不清楚上游真实键集，用看似“稳健不崩”的 `weights.get("critical_weight")`、`weights.get("bottleneck_weight")` 读取——结果拼写错配既不抛 `KeyError` 也不触发类型告警，所有权重在生产环境常年 100% 静默变成 `None` 失效。
+- **正确做法**：遵循“准入即定型”——上游直接交出字段固定的不可变 dataclass / `TypedDict`，下游直接按属性或 `weights["critical_path"]` 强索引，让任何字段改名或拼写错配在静态类型检查与首次运行瞬间当场暴露。
+
+### 204. 严禁“为躲顶层循环依赖门禁把文件头 `import` 塞进函数体内变延迟导入环，甚至让下层仓储在函数内反向导入上层服务”（Function-Body Lazy `import` Cycle Dodging & Repository-to-Service Reverse Imports Instead of Layer Splitting）
+> 母题：L 删旧壳时搬家兜底 · B 多余的层
+
+- **典型坏习惯**：
+  - 模块依赖门禁报出 `history ↔ simulation` 顶层目录环时，编码模型不去拆开 `history` 包里混居的“底层历史条目写入”与“上层跨模块对比指标”，只把 `from ...history import ...` 从文件顶层挪进函数体内，让顶层硬环计数表面归零；
+  - 更甚者，在底层 `data/repositories/run_repo.py` 的方法体内写延迟导入 `from core.services.history.entry_writer import ...`，把服务编排塞进仓储层并串出横跨 20 个目录的隐形运行时大环。
+- **正确做法**：消除循环依赖必须通过职责分层与提取下沉包（如将无上层依赖的 `history_entries` 独立下沉、将事务收尾编排提回服务层 `run/terminal.py`）在物理依赖图上真正断环，并将函数体内延迟导入一并纳入循环依赖棘轮监管；严禁下层仓储以任何形式导入上层业务服务。
+
+### 205. 严禁“为过 SQL 分层门禁不核查调用链死活，把上层 0 触发死分支里的 SQL 抽成底层新仓储方法”（Extracting New Repository Methods for Unreachable Upstream Dead-Branch SQL Just to Satisfy Layering Ratchets）
+> 母题：L 删旧壳时搬家兜底 · C 清理不彻底 · A 死分支、死参数、伪可选
+
+- **典型坏习惯**：
+  - 分层扫描器报出服务层 `entry_writer.py` 某缺省回退分支内含裸 SQL 查询时，编码模型不先核查该分支在真实生产调用链中是否可达（实际所有调用方均已传入确定时间戳，该缺省分支 100% 永不触发），就机械地在仓储层新建 `repo.latest_history_time()` 方法把死 SQL 搬过去，用新抽象给死分支续命。
+- **正确做法**：修复分层违规前必先做存在性拷问（拷问 1）——用符号工具核清所在分支的生产可达性；若属不可达死分支，直接连根删除该分支，绝不为死代码下沉新建仓储接口。
+
+### 206. 严禁“替换底层查询或执行原语后，原封不动保留旧原语时代用来控分片的排序、去重与空集守卫”（Replacing Underlying Query Primitives Without Stripping Obsolete Chunking/Sorting/Empty-Set Guards）
+> 母题：C 清理不彻底 · G 重复计算
+
+- **典型坏习惯**：
+  - 将仓储层分片拼装 `WHERE id IN (?, ?, ...)` 的循环统一升级为单次 `WHERE id IN (SELECT value FROM json_each(?))` 原语后，逐处原地保留了分片时代只为固定分片边界和避免空 `IN ()` 语法错误而写的 `sorted(set(keys))` 与 `if not keys: return []` 空集守卫（甚至在批量改写中净增几十处重复守卫）。
+- **正确做法**：升级底层共同原语时，同步将集合编码规约收进唯一的键集参数原语，并把旧实现时代遗留在各调用点的冗余排序、重复去重与无职责空集守卫一次性剥离干净。
+
+### 207. 严禁“前端异步查询混用‘过渡展示旧值’与‘当前身份真值’，导致刷新或失败期间导出/提交上一对象的旧数据”（Conflating Transitional Display Value with Current-Identity Result in Async Queries & Exporting Stale Data During Refresh/Error）
+> 母题：N 事务、锁与状态生命周期 · O 语义走样
+
+- **典型坏习惯**：
+  - 前端查询 Hook 为了在切换筛选条件或刷新时不白屏闪烁，在请求进行中或失败时仍让 `query.data` 返回上一轮旧对象的数据；
+  - 页面上的「导出方案」「保存修改」按钮直接读取同一个 `query.data`，导致用户在切换到对象 B 且正在加载（或加载报错）时点击导出，实际把对象 A 的旧草稿导了出去。
+- **正确做法**：在统一查询会话（如 `useQuery`）源头将两个语义拆成不同字段：`result` 严格只代表已就绪且匹配当前请求身份的真值（加载中或失败时为 `null`），`shown` 专供无副作用的界面过渡展示；一切导出、提交与派生写操作只准读取 `result`。
+
+### 208. 严禁“外部子进程运行时选型或引擎缺陷规避参数不在唯一启动入口收口，反而在个别报错测试里散打命令行补丁”（Scattering Runtime Workaround Flags Across Individual Failing Tests Instead of Unifying Subprocess Selection at a Single Entry）
+> 母题：J 口径没在源头统一
+
+- **典型坏习惯**：
+  - 宿主特定版本的 Node 运行时（如 v24.0..v24.21 在高频 `vm.runInContext` 下触发 V8 Sparkplug GC 栈扫描段错误）存在已知引擎缺陷，且负信号退出时双流为空难排查；
+  - 编码者不在唯一的 Node 运行时选型与子进程启动模块中按版本区间统一注入 `--no-sparkplug` 与信号诊断，反而只在刚好跑崩的那一个测试文件里硬编码塞入 `--jitless` 局部特例，放任构建脚本、门禁钩子和其他 20 个同机制测试继续裸奔。
+- **正确做法**：外部运行时的版本探测、引擎规避标志注入、跨目录环境变量锚定与崩溃信号诊断，必须收口到唯一的运行时选型与执行入口（所有构建、钩子、Python 测试与嵌套子进程契约统一经它启动），严禁在个别调用点散打特例参数。

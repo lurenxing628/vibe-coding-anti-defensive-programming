@@ -12,29 +12,31 @@ import re
 import shutil
 import subprocess
 import time
-from typing import Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
-from .static_index import REPO_ROOT
+if TYPE_CHECKING:
+    from .static_index import StaticIndex
 
-SCIP_DIR = os.path.join(REPO_ROOT, ".checkup", "scip")
-INDEX_FILE = os.path.join(SCIP_DIR, "index.scip")
+SCIP_INDEX_REL = os.path.join(".checkup", "scip", "index.scip")
 DEFINITION_ROLE = 1
+
+
+def default_index_path(repo_root: str) -> str:
+    return os.path.join(repo_root, SCIP_INDEX_REL)
 
 
 class ScipUnavailable(Exception):
     """``--deep`` 需要的外部命令或索引不存在。"""
 
-    def __init__(self, code, message, hints=None):
-        # type: (str, str, Optional[List[str]]) -> None
+    def __init__(self, code: str, message: str, hints: Optional[List[str]] = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.hints = list(hints or [])
 
 
-def ensure_index(index_path=None):
-    # type: (Optional[str]) -> str
-    path = os.path.abspath(index_path or INDEX_FILE)
+def ensure_index(index_path: str) -> str:
+    path = os.path.abspath(index_path)
     if shutil.which("scip") is None:
         raise ScipUnavailable(
             "missing_scip_cli",
@@ -57,8 +59,7 @@ def ensure_index(index_path=None):
     return path
 
 
-def build_index(index_path=None, stdout=None):
-    # type: (Optional[str], Any) -> str
+def build_index(repo_root: str, index_path: str, stdout: Any) -> str:
     """用 scip-python 重建索引。成功返回索引绝对路径。"""
     if shutil.which("scip-python") is None:
         raise ScipUnavailable(
@@ -66,7 +67,7 @@ def build_index(index_path=None, stdout=None):
             "未找到 scip-python,无法生成 SCIP 索引。",
             ["安装命令:npm i -g @sourcegraph/scip-python"],
         )
-    path = os.path.abspath(index_path or INDEX_FILE)
+    path = os.path.abspath(index_path)
     parent = os.path.dirname(path)
     if not os.path.isdir(parent):
         os.makedirs(parent)
@@ -79,19 +80,18 @@ def build_index(index_path=None, stdout=None):
             "--output",
             path,
         ],
-        cwd=REPO_ROOT,
+        cwd=repo_root,
         check=True,
         stdout=stdout,
     )
     return path
 
 
-def load_documents(index_path=None):
-    # type: (Optional[str]) -> Dict
-    path = ensure_index(index_path=index_path)
+def load_documents(repo_root: str, index_path: str) -> Dict:
+    path = ensure_index(index_path)
     proc = subprocess.run(
         ["scip", "print", "--json", path],
-        cwd=REPO_ROOT,
+        cwd=repo_root,
         capture_output=True,
         text=True,
     )
@@ -109,17 +109,16 @@ def load_documents(index_path=None):
     }
 
 
-def query(name, direction, static_index, index_path=None):
-    # type: (str, str, object, Optional[str]) -> Dict
-    data = load_documents(index_path=index_path)
+def query(name: str, direction: str, static_index: object, repo_root: str) -> Dict:
+    data = load_documents(repo_root, default_index_path(repo_root))
     docs = data["documents"]
     defs = _definitions_for_name(docs, name, static_index)
     if direction == "whereis":
         rows = defs
     elif direction == "callers":
-        rows = _callers_for_defs(docs, defs)
+        rows = _callers_for_defs(docs, defs, repo_root)
     elif direction == "callees":
-        rows = _callees_for_defs(docs, defs, static_index)
+        rows = _callees_for_defs(docs, defs, static_index, repo_root)
     else:
         raise ValueError("unknown direction: " + direction)
     return {
@@ -136,8 +135,7 @@ def query(name, direction, static_index, index_path=None):
     }
 
 
-def _parse_scip_print(text):
-    # type: (str) -> List[Dict]
+def _parse_scip_print(text: str) -> List[Dict]:
     stripped = text.strip()
     if not stripped:
         return []
@@ -156,8 +154,7 @@ def _parse_scip_print(text):
     return []
 
 
-def _parse_ndjson(lines):
-    # type: (Iterable[str]) -> List[Dict]
+def _parse_ndjson(lines: Iterable[str]) -> List[Dict]:
     docs = []
     for line in lines:
         raw = line.strip()
@@ -169,48 +166,40 @@ def _parse_ndjson(lines):
     return docs
 
 
-def _symbol_pattern(name):
-    # type: (str) -> re.Pattern
+def _symbol_pattern(name: str) -> re.Pattern:
     # 精确匹配函数/方法符号,排除 ``foo().(param)`` 这类参数符号。
     return re.compile(r"[/#]" + re.escape(name) + r"\(\)\.$")
 
 
-def _is_target_symbol(symbol, name):
-    # type: (str, str) -> bool
+def _is_target_symbol(symbol: str, name: str) -> bool:
     return bool(_symbol_pattern(name).search(symbol))
 
 
-def _is_callable_symbol(symbol):
-    # type: (str) -> bool
+def _is_callable_symbol(symbol: str) -> bool:
     return bool(re.search(r"[/#][A-Za-z_][A-Za-z0-9_]*\(\)\.$", symbol))
 
 
-def _roles(occ):
-    # type: (Dict) -> int
+def _roles(occ: Dict) -> int:
     return int(occ.get("symbol_roles") or occ.get("symbolRoles") or 0)
 
 
-def _path(doc):
-    # type: (Dict) -> str
+def _path(doc: Dict) -> str:
     return str(doc.get("relative_path") or doc.get("path") or "")
 
 
-def _line(occ):
-    # type: (Dict) -> int
+def _line(occ: Dict) -> int:
     rng = occ.get("range") or []
     if not rng:
         return 0
     return int(rng[0]) + 1
 
 
-def _range_key(occ):
-    # type: (Dict) -> str
+def _range_key(occ: Dict) -> str:
     rng = occ.get("range") or []
     return ":".join(str(part) for part in rng)
 
 
-def _row(doc, occ, target_symbol=None):
-    # type: (Dict, Dict, Optional[str]) -> Dict
+def _row(doc: Dict, occ: Dict, target_symbol: Optional[str] = None) -> Dict:
     symbol = str(occ.get("symbol") or "")
     return {
         "path": _path(doc),
@@ -222,8 +211,7 @@ def _row(doc, occ, target_symbol=None):
     }
 
 
-def _definitions_for_name(docs, name, static_index):
-    # type: (List[Dict], str, object) -> List[Dict]
+def _definitions_for_name(docs: List[Dict], name: str, static_index: object) -> List[Dict]:
     static_targets = _static_definition_locations(name, static_index)
     rows = []
     for doc in docs:
@@ -237,8 +225,7 @@ def _definitions_for_name(docs, name, static_index):
     return _dedupe_rows(rows)
 
 
-def _static_definition_locations(name, static_index):
-    # type: (str, object) -> set
+def _static_definition_locations(name: str, static_index: StaticIndex) -> set:
     result = set()
     for key in static_index.lookup_name(name):
         info = static_index.info(key)
@@ -247,8 +234,7 @@ def _static_definition_locations(name, static_index):
     return result
 
 
-def _callers_for_defs(docs, defs):
-    # type: (List[Dict], List[Dict]) -> List[Dict]
+def _callers_for_defs(docs: List[Dict], defs: List[Dict], repo_root: str) -> List[Dict]:
     targets = set(row["symbol"] for row in defs)
     rows = []
     call_cache = {}
@@ -256,20 +242,19 @@ def _callers_for_defs(docs, defs):
         for occ in doc.get("occurrences") or []:
             symbol = str(occ.get("symbol") or "")
             if (symbol in targets and not (_roles(occ) & DEFINITION_ROLE)
-                    and _is_call_occurrence(doc, occ, call_cache)):
+                    and _is_call_occurrence(repo_root, doc, occ, call_cache)):
                 rows.append(_row(doc, occ, target_symbol=symbol))
     return _dedupe_rows(rows)
 
 
-def _is_call_occurrence(doc, occ, call_cache):
-    # type: (Dict, Dict, Dict[str, List]) -> bool
+def _is_call_occurrence(repo_root: str, doc: Dict, occ: Dict, call_cache: Dict[str, List]) -> bool:
     """SCIP 只告诉我们“这里引用了目标符号”,这里再用 AST 确认它真在调用位。"""
     rng = occ.get("range") or []
     if len(rng) < 2:
         return False
     path = _path(doc)
     if path not in call_cache:
-        call_cache[path] = _call_func_ranges(path)
+        call_cache[path] = _call_func_ranges(repo_root, path)
     line_no = int(rng[0]) + 1
     col = int(rng[1])
     for start_line, start_col, end_line, end_col in call_cache[path]:
@@ -278,9 +263,8 @@ def _is_call_occurrence(doc, occ, call_cache):
     return False
 
 
-def _call_func_ranges(path):
-    # type: (str) -> List
-    text = _read_source(path)
+def _call_func_ranges(repo_root: str, path: str) -> List:
+    text = _read_source(repo_root, path)
     if text is None:
         return []
     try:
@@ -302,9 +286,8 @@ def _call_func_ranges(path):
     return ranges
 
 
-def _read_source(path):
-    # type: (str) -> Optional[str]
-    full = os.path.join(REPO_ROOT, path)
+def _read_source(repo_root: str, path: str) -> Optional[str]:
+    full = os.path.join(repo_root, path)
     try:
         with open(full, encoding="utf-8") as fh:
             return fh.read()
@@ -312,8 +295,7 @@ def _read_source(path):
         return None
 
 
-def _contains_position(line_no, col, start_line, start_col, end_line, end_col):
-    # type: (int, int, int, int, int, int) -> bool
+def _contains_position(line_no: int, col: int, start_line: int, start_col: int, end_line: int, end_col: int) -> bool:
     if line_no < start_line or line_no > end_line:
         return False
     if line_no == start_line and col < start_col:
@@ -323,8 +305,7 @@ def _contains_position(line_no, col, start_line, start_col, end_line, end_col):
     return True
 
 
-def _callees_for_defs(docs, defs, static_index):
-    # type: (List[Dict], List[Dict], object) -> List[Dict]
+def _callees_for_defs(docs: List[Dict], defs: List[Dict], static_index: object, repo_root: str) -> List[Dict]:
     docs_by_path = {}
     for doc in docs:
         docs_by_path[_path(doc)] = doc
@@ -344,14 +325,13 @@ def _callees_for_defs(docs, defs, static_index):
                 continue
             if not _is_callable_symbol(symbol):
                 continue
-            if not _is_call_occurrence(doc, occ, call_cache):
+            if not _is_call_occurrence(repo_root, doc, occ, call_cache):
                 continue
             rows.append(_row(doc, occ, target_symbol=definition["symbol"]))
     return _dedupe_rows(rows)
 
 
-def _function_bounds(definition, doc, static_index):
-    # type: (Dict, Dict, object) -> (int, int)
+def _function_bounds(definition: Dict, doc: Dict, static_index: object) -> Tuple[int, int]:
     path = definition["path"]
     line_no = int(definition["line"])
     for key in getattr(static_index, "functions", {}):
@@ -365,8 +345,7 @@ def _function_bounds(definition, doc, static_index):
     return line_no, line_no
 
 
-def _find_definition_occurrence(doc, definition):
-    # type: (Dict, Dict) -> Optional[Dict]
+def _find_definition_occurrence(doc: Dict, definition: Dict) -> Optional[Dict]:
     wanted_range = definition.get("range") or []
     wanted_symbol = definition.get("symbol")
     for occ in doc.get("occurrences") or []:
@@ -375,8 +354,7 @@ def _find_definition_occurrence(doc, definition):
     return None
 
 
-def _dedupe_rows(rows):
-    # type: (List[Dict]) -> List[Dict]
+def _dedupe_rows(rows: List[Dict]) -> List[Dict]:
     seen = set()
     result = []
     for row in rows:
@@ -389,8 +367,7 @@ def _dedupe_rows(rows):
     return result
 
 
-def display_symbol(symbol):
-    # type: (str) -> str
+def display_symbol(symbol: str) -> str:
     match = re.search(r"`([^`]+)`/(.+)$", symbol)
     if match:
         return f"{match.group(1)}/{match.group(2)}".rstrip(".")

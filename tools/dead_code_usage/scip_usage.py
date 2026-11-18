@@ -1,7 +1,8 @@
 """SCIP 精确引用确认。
 
 本模块只服务 ``scan_dead_code_islands.py --mode precise``。
-精确模式的前置条件不满足时抛明确错误,不回退到快模式。
+``load_precise_index`` 是精确模式的前置检查与读取入口（工作区干净、scip CLI、索引文件、索引版本是 HEAD），
+扫描器在跑调用图之前调用它；前置条件不满足时抛明确错误,不回退到快模式。
 """
 from __future__ import annotations
 
@@ -12,9 +13,9 @@ import re
 import shutil
 import subprocess
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
-from .model import FunctionRecord, UsageEvidence
+from .model import CodeRoles, FunctionRecord, UsageEvidence
 
 SCIP_INDEX = os.path.join(".checkup", "scip", "index.scip")
 DEFINITION_ROLE = 1
@@ -22,24 +23,26 @@ _VERSION_RE = re.compile(r"\b[A-Za-z0-9_.-]+\s+([0-9a-f]{40})\b")
 
 
 class ScipUsageError(Exception):
-    def __init__(self, code, message, hints=None):
-        # type: (str, str, Optional[List[str]]) -> None
+    def __init__(self, code: str, message: str, hints: Sequence[str] = ()) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
-        self.hints = list(hints or [])
+        self.hints = list(hints)
 
 
-def collect_scip_usage(repo_root, records, index_path=None):
-    # type: (str, Dict[str, FunctionRecord], Optional[str]) -> Dict[str, List[UsageEvidence]]
-    path = _require_fresh_index(repo_root, index_path=index_path)
-    docs = _load_documents(repo_root, path)
+def load_precise_index(repo_root: str, index_path: Optional[str] = None) -> List[Dict]:
+    """检查精确模式的前置条件并读出索引文档；任何一项不满足都抛 ScipUsageError。"""
+    return _load_documents(repo_root, _require_fresh_index(repo_root, index_path=index_path))
+
+
+def collect_scip_usage(repo_root: str, docs: List[Dict], records: Dict[str, FunctionRecord],
+                       roles: CodeRoles) -> Dict[str, List[UsageEvidence]]:
+    """docs 是 load_precise_index 读出的索引文档；证据来源取引用所在文件的角色（roles.of）。"""
     symbols = _definition_symbols(docs, records)
-    return _references_for_symbols(repo_root, docs, symbols)
+    return _references_for_symbols(repo_root, docs, symbols, roles)
 
 
-def _require_fresh_index(repo_root, index_path=None):
-    # type: (str, Optional[str]) -> str
+def _require_fresh_index(repo_root: str, index_path: Optional[str] = None) -> str:
     if _git_dirty(repo_root):
         raise ScipUsageError(
             "dirty_worktree",
@@ -85,8 +88,7 @@ def _load_documents(repo_root, path):
     return docs
 
 
-def _parse_scip_documents(text):
-    # type: (str) -> List[Dict]
+def _parse_scip_documents(text: str) -> List[Dict]:
     stripped = text.strip()
     if not stripped:
         return []
@@ -105,8 +107,7 @@ def _parse_scip_documents(text):
     raise ScipUsageError("scip_json_invalid", "scip print JSON 中没有 documents 列表。")
 
 
-def _parse_ndjson(lines):
-    # type: (Iterable[str]) -> List[Dict]
+def _parse_ndjson(lines: Iterable[str]) -> List[Dict]:
     docs = []
     try:
         for line in lines:
@@ -129,7 +130,7 @@ def _require_index_version(repo_root, docs):
             symbol = str(occ.get("symbol") or "")
             versions.update(_VERSION_RE.findall(symbol))
     if head not in versions:
-        sample = ", ".join(sorted(versions)[:3]) or "未发现索引版本号"
+        sample = ", ".join(sorted(versions)[:3]) or "未发现项目版本号"
         raise ScipUsageError(
             "stale_index",
             f"SCIP 索引不是当前 HEAD。当前 HEAD={head[:12]},索引版本={sample}",
@@ -144,33 +145,29 @@ def _git_head(repo_root):
     return proc.stdout.strip()
 
 
-def _definition_symbols(docs, records):
-    # type: (List[Dict], Dict[str, FunctionRecord]) -> Dict[str, Set[str]]
-    by_location = defaultdict(list)
+def _definition_symbols(docs: List[Dict], records: Dict[str, FunctionRecord]) -> Dict[str, Set[str]]:
+    by_location: Dict[Tuple[str, int], List[str]] = defaultdict(list)
     for qual, record in records.items():
-        by_location[(record.rel, record.line, record.name, record.cls)].append(qual)
-    result = defaultdict(set)  # type: Dict[str, Set[str]]
+        by_location[(record.rel, record.line)].append(qual)
+    result: Dict[str, Set[str]] = defaultdict(set)
     for doc in docs:
         path = _path(doc)
         for occ in doc.get("occurrences") or []:
-            roles = _roles(occ)
-            if not roles & DEFINITION_ROLE:
+            if not _roles(occ) & DEFINITION_ROLE:
                 continue
-            line = _line(occ)
             symbol = str(occ.get("symbol") or "")
-            for qual, record in records.items():
-                if path != record.rel or line != record.line:
-                    continue
-                if _matches_record_symbol(symbol, record):
+            for qual in by_location.get((path, _line(occ)), ()):
+                if _matches_record_symbol(symbol, records[qual]):
                     result[qual].add(symbol)
     return result
 
 
-def _references_for_symbols(repo_root, docs, symbols_by_qual):
-    # type: (str, List[Dict], Dict[str, Set[str]]) -> Dict[str, List[UsageEvidence]]
+def _references_for_symbols(
+    repo_root: str, docs: List[Dict], symbols_by_qual: Dict[str, Set[str]], roles: CodeRoles
+) -> Dict[str, List[UsageEvidence]]:
     grouped = defaultdict(list)
     targets = {}
-    import_cache = {}  # type: Dict[str, List[Tuple[int, int, int, int]]]
+    import_cache: Dict[str, List[Tuple[int, int, int, int]]] = {}
     for qual, symbols in symbols_by_qual.items():
         for symbol in symbols:
             targets[symbol] = qual
@@ -192,13 +189,13 @@ def _references_for_symbols(repo_root, docs, symbols_by_qual):
                     line=_line(occ),
                     kind="scip_reference",
                     detail=symbol,
+                    origin=roles.of(path),
                 )
             )
     return {qual: rows for qual, rows in grouped.items()}
 
 
-def _is_import_reference(repo_root, rel, occ, import_cache):
-    # type: (str, str, Dict, Dict[str, List[Tuple[int, int, int, int]]]) -> bool
+def _is_import_reference(repo_root: str, rel: str, occ: Dict, import_cache: Dict[str, List[Tuple[int, int, int, int]]]) -> bool:
     rng = occ.get("range") or []
     if len(rng) < 2:
         return False
@@ -212,15 +209,11 @@ def _is_import_reference(repo_root, rel, occ, import_cache):
     return False
 
 
-def _import_reference_ranges(repo_root, rel):
-    # type: (str, str) -> List[Tuple[int, int, int, int]]
-    text = _read_source(repo_root, rel)
-    if text is None:
-        return []
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
-        return []
+def _import_reference_ranges(repo_root: str, rel: str) -> List[Tuple[int, int, int, int]]:
+    """索引与干净的 HEAD 工作区一致，索引里的文件必然存在且能解析；读不到就是真实故障，直接抛出。"""
+    with open(os.path.join(repo_root, rel), encoding="utf-8") as handle:
+        text = handle.read()
+    tree = ast.parse(text)
     lines = text.splitlines()
     ranges = []
     for node in ast.walk(tree):
@@ -230,46 +223,27 @@ def _import_reference_ranges(repo_root, rel):
     return ranges
 
 
-def _read_source(repo_root, rel):
-    # type: (str, str) -> Optional[str]
-    try:
-        with open(os.path.join(repo_root, rel), encoding="utf-8") as handle:
-            return handle.read()
-    except OSError:
-        return None
-
-
-def _imported_names(node):
-    # type: (ast.AST) -> Set[str]
+def _imported_names(node: Union[ast.Import, ast.ImportFrom]) -> Set[str]:
     names = set()
-    for alias in getattr(node, "names", []):
-        raw = str(getattr(alias, "name", "") or "")
-        if raw:
-            names.add(raw.split(".")[-1])
-        asname = getattr(alias, "asname", None)
-        if asname:
-            names.add(str(asname))
+    for alias in node.names:
+        names.add(alias.name.split(".")[-1])
+        if alias.asname:
+            names.add(alias.asname)
     return names
 
 
-def _name_ranges_in_import(lines, node, names):
-    # type: (List[str], ast.AST, Set[str]) -> List[Tuple[int, int, int, int]]
-    if not names:
-        return []
-    start_line = int(getattr(node, "lineno", 0) or 0)
-    end_line = int(getattr(node, "end_lineno", start_line) or start_line)
-    start_col = int(getattr(node, "col_offset", 0) or 0)
-    end_col = getattr(node, "end_col_offset", None)
+def _name_ranges_in_import(
+    lines: List[str], node: Union[ast.Import, ast.ImportFrom], names: Set[str]
+) -> List[Tuple[int, int, int, int]]:
+    start_line = node.lineno
+    end_line = node.end_lineno
+    end_col = node.end_col_offset
+    assert end_line is not None and end_col is not None
     ranges = []
     for line_no in range(start_line, end_line + 1):
-        if line_no <= 0 or line_no > len(lines):
-            continue
         raw = lines[line_no - 1]
-        segment_start = start_col if line_no == start_line else 0
-        if line_no == end_line and end_col is not None:
-            segment_end = int(end_col)
-        else:
-            segment_end = len(raw)
+        segment_start = node.col_offset if line_no == start_line else 0
+        segment_end = end_col if line_no == end_line else len(raw)
         segment = raw[segment_start:segment_end]
         for name in names:
             pattern = r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])"
@@ -278,8 +252,7 @@ def _name_ranges_in_import(lines, node, names):
     return ranges
 
 
-def _contains_position(line_no, col, start_line, start_col, end_line, end_col):
-    # type: (int, int, int, int, int, int) -> bool
+def _contains_position(line_no: int, col: int, start_line: int, start_col: int, end_line: int, end_col: int) -> bool:
     if line_no < start_line or line_no > end_line:
         return False
     if line_no == start_line and col < start_col:
@@ -289,8 +262,7 @@ def _contains_position(line_no, col, start_line, start_col, end_line, end_col):
     return True
 
 
-def _matches_record_symbol(symbol, record):
-    # type: (str, FunctionRecord) -> bool
+def _matches_record_symbol(symbol: str, record: FunctionRecord) -> bool:
     if record.cls:
         return f"#{record.name}()." in symbol and f"/{record.cls}#" in symbol
     return symbol.endswith(f"/{record.name}().")

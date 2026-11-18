@@ -33,7 +33,7 @@ SOCKET = os.path.expanduser("~/.codex/app-server-control/app-server-control.sock
 # Shared with codex_view.py: per lane, which thread is current and whether a turn is
 # running; latest_lane names the lane whose turn started last.
 BASE = Path.home() / ".cache" / "agy-dual-model-pipeline" / "codex"
-MODEL = "gpt-6-astra-minor"
+MODEL = "gpt-6.2-sol"
 EFFORT = "ultra"
 EXIT_BUSY = 75
 EXIT_IDLE = 76

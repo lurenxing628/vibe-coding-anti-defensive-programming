@@ -6,31 +6,31 @@ from __future__ import annotations
 
 import difflib
 import json as _json
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from .static_index import StaticIndex
 
 _MENU_MAX = 20  # 同名碰撞菜单最多列几条,超出折叠
 
 
-def _loc(info):
-    # type: (Dict) -> str
+def _loc(info: Dict) -> str:
     return f"{info['rel']}:{info['line']}-{info.get('end', info['line'])}"
 
 
-def _loc_full(key, info):
-    # type: (str, Optional[Dict]) -> str
+def _loc_full(key: str, info: Optional[Dict]) -> str:
     if info is None:
         return key  # 指向未索引/三方函数,原样显示 key
     qual = key.split("::", 1)[-1]
     return f"{info['rel']}:{info['line']}  {qual}  (被调 {info.get('fan_in', 0)} · 调用 {info.get('fan_out', 0)})"
 
 
-def render_whereis(name, index, as_json=False, at=None):
-    # type: (str, object, bool, object) -> int
+def render_whereis(name: str, index: StaticIndex, repo_root: str, as_json: bool = False, at: object = None) -> int:
     keys = index.lookup_name(name)
     if not keys:
         return _not_found(name, index, as_json)
     if at is not None:
-        return _render_whereis_at(name, at, index, as_json)
+        return _render_whereis_at(name, at, index, repo_root, as_json)
     if as_json:
         matches = _whereis_matches(keys, index)
         print(_json.dumps({"symbol": name, "matches": matches}, ensure_ascii=False, indent=2))
@@ -52,11 +52,10 @@ def render_whereis(name, index, as_json=False, at=None):
     return 0
 
 
-def _render_whereis_at(name, at, index, as_json=False):
-    # type: (str, object, object, bool) -> int
+def _render_whereis_at(name: str, at: object, index: StaticIndex, repo_root: str, as_json: bool) -> int:
     from . import jedi_resolver
     file_rel, line = at
-    hits = jedi_resolver.resolve_at(file_rel, line, name)
+    hits = jedi_resolver.resolve_at(file_rel, line, name, repo_root)
     if hits is None:
         reason = "missing_jedi" if not jedi_resolver.available() else "callpoint_not_resolved"
         if as_json:
@@ -70,7 +69,7 @@ def _render_whereis_at(name, at, index, as_json=False):
             print("(jedi 不可用,降级到静态结果;在工具解释器装 jedi 可启用精确消歧)")
         else:
             print(f"(在 {file_rel}:{line} 未定位到 {name!r} 的调用点,降级到静态结果)")
-        return render_whereis(name, index, as_json=as_json)
+        return render_whereis(name, index, repo_root, as_json=as_json)
     if as_json:
         print(_json.dumps(
             {"symbol": name, "at": f"{file_rel}:{line}",
@@ -87,10 +86,11 @@ def _render_whereis_at(name, at, index, as_json=False):
     return 0
 
 
-def render_relation(name, index, direction, as_json=False, deep=False):
-    # type: (str, object, str, bool, bool) -> int
+def render_relation(
+    name: str, index: StaticIndex, direction: str, repo_root: str, as_json: bool = False, deep: bool = False
+) -> int:
     if deep:
-        return _render_deep_relation(name, index, direction, as_json=as_json)
+        return _render_deep_relation(name, index, direction, repo_root, as_json)
     keys = index.lookup_name(name)
     if not keys:
         return _not_found(name, index, as_json)
@@ -122,11 +122,10 @@ def render_relation(name, index, direction, as_json=False, deep=False):
     return 0
 
 
-def _render_deep_relation(name, index, direction, as_json=False):
-    # type: (str, object, str, bool) -> int
+def _render_deep_relation(name: str, index: object, direction: str, repo_root: str, as_json: bool) -> int:
     from . import scip_deep
     try:
-        payload = scip_deep.query(name, direction, index)
+        payload = scip_deep.query(name, direction, index, repo_root)
     except scip_deep.ScipUnavailable as exc:
         if as_json:
             print(_json.dumps(
@@ -170,8 +169,7 @@ def _render_deep_relation(name, index, direction, as_json=False):
     return 0
 
 
-def _print_blindspots(data, direction):
-    # type: (Dict, str) -> None
+def _print_blindspots(data: Dict, direction: str) -> None:
     notes = []
     if data["ambiguous"]:
         notes.append(f"另有 {data['ambiguous']} 条 ambiguous 边(消解不确定,未计入)")
@@ -182,8 +180,7 @@ def _print_blindspots(data, direction):
     print("  → 加 --deep 用 scip 全量精确枚举(含 tests)")
 
 
-def _not_found(name, index, as_json):
-    # type: (str, object, bool) -> int
+def _not_found(name: str, index: StaticIndex, as_json: bool) -> int:
     near = difflib.get_close_matches(name, index.all_names(), n=5, cutoff=0.6)
     if as_json:
         print(_json.dumps({"symbol": name, "error": "not_found", "suggestions": near},
@@ -195,8 +192,7 @@ def _not_found(name, index, as_json):
     return 1
 
 
-def _whereis_matches(keys, index):
-    # type: (List[str], object) -> List[Dict]
+def _whereis_matches(keys: List[str], index: StaticIndex) -> List[Dict]:
     matches = []
     for key in keys:
         info = index.info(key)

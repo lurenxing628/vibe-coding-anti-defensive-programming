@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""死代码孤岛防回潮扫描器。
+"""死代码孤岛棘轮扫描器（dead_code_islands 规则）。
 
-复用静态调用图工具 tools/callgraph/callgraph_extract.py:把它的产物输出
-经 CHECKUP_CALLGRAPH 重定向到 OS 临时目录(绝不弄脏已提交目录、
-不破坏净树证明),读临时目录里的 functions/edges/islands,再用真实使用图过滤误报。
+候选：用 tools/callgraph/callgraph_extract.py（固定 --mode light，产物写到 OS 临时目录，
+不碰已提交的 latest/callgraph/）取函数与调用边，去掉测试角色（路径角色见 tools/path_roles.py）的函数
+及其相连的边后，仍没有任何调用边的函数。
 
-quick 模式只用 AST 使用图,适合 pre-push。
-precise 模式要求新鲜 SCIP 索引;索引缺失/过期/工作区脏时直接失败,不回退。
+使用证据按来源分栏（``Reference.origin``）：只用生产与宿主工具代码求解就有引用的算在用，不报；
+只有测试证据的记 test_only（测试文件里的引用，及测试传入的类型经生产代码形成的引用）；没有任何引用的记 suspect_dead。
+条目 path 是函数限定名、kind 是上面两种之一、count 恒为 1；基线走共用棘轮，只减不增。
 
---warn-only 只把"发现新增疑似死代码"降成提示;工具错误仍然非零退出。
+quick 模式只用 AST 使用图（tools/dead_code_usage 的公开引用索引），进日常门禁与完整门禁。
+precise 模式另加新鲜 SCIP 索引的引用，只出报告、不读写基线；索引缺失、过期或工作区脏时在跑调用图之前
+直接失败，不回退。
+
+用法：
+    python -m tools.scan_dead_code_islands [--mode quick|precise] [--json] [--fail-on-new]
+        [--refresh [--allow-growth]] [--quiet-when-clean]
 """
 from __future__ import annotations
 
@@ -19,201 +26,166 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Dict, List, Optional, Sequence, Set, cast
+from collections import defaultdict
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+if __name__ == "__main__":  # 按文件路径运行时让仓库根下的 tools 包可导入
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tools.boundary_baseline import add_ratchet_arguments, run_ratchet_cli
 from tools.dead_code_usage.ast_usage import collect_ast_usage
-from tools.dead_code_usage.model import UsageEvidence, records_from_functions
+from tools.dead_code_usage.model import CodeRoles, UsageEvidence, records_from_functions
+from tools.dead_code_usage.scip_usage import ScipUsageError, collect_scip_usage, load_precise_index
+from tools.path_roles import ROLES, TEST, iter_role_files, role_of, role_roots
+from tools.repo_paths import resolve_repo_root
 
-CALLGRAPH_EXTRACT = os.path.join(REPO_ROOT, "tools", "callgraph", "callgraph_extract.py")
-BASELINE_PATH = os.path.join(REPO_ROOT, ".checkup", "dead_code_islands_baseline.json")
-BASELINE_REL = os.path.relpath(BASELINE_PATH, REPO_ROOT)
+#: 调用图提取脚本属于本工具自带资产，按工具所属仓库根定位；被扫描仓库由 repo_root 指定，可以是别的目录。
+CALLGRAPH_EXTRACT_REL = os.path.join("tools", "callgraph", "callgraph_extract.py")
+RULE = "dead_code_islands"
+KINDS = ("suspect_dead", "test_only")
+BASELINE_NOTE = (
+    "死代码疑似项棘轮基线：候选是去掉测试角色后调用图里没有任何边的函数；"
+    "suspect_dead=没有任何引用，test_only=只有测试代码引用。条目只减不增，"
+    "受控刷新：python -m tools.scan_dead_code_islands --mode quick --refresh。"
+)
 
 
-def _compute_callgraph_snapshot() -> Dict[str, object]:
-    """跑 callgraph_extract 到临时目录,返回当前函数/边/候选孤岛。"""
-    tmp_dir = tempfile.mkdtemp(prefix="dead_code_islands_")
+class CallgraphError(RuntimeError):
+    """调用图子进程失败，没有可信的函数与调用边。"""
+
+
+def _callgraph(repo_root: str) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    out_dir = tempfile.mkdtemp(prefix="dead_code_islands_")
     try:
         env = dict(os.environ)
-        env["CHECKUP_CALLGRAPH"] = tmp_dir
+        env["CHECKUP_CALLGRAPH"] = out_dir
+        extractor = os.path.join(resolve_repo_root(), CALLGRAPH_EXTRACT_REL)
         proc = subprocess.run(
-            [sys.executable, CALLGRAPH_EXTRACT],
-            cwd=REPO_ROOT,
+            [sys.executable, extractor, "--mode", "light", "--repo-root", repo_root],
+            cwd=repo_root,
             env=env,
             capture_output=True,
             text=True,
         )
-        paths = {
-            "functions": os.path.join(tmp_dir, "functions.json"),
-            "edges": os.path.join(tmp_dir, "edges.json"),
-            "islands": os.path.join(tmp_dir, "islands.json"),
-        }
-        if proc.returncode != 0 or not all(os.path.isfile(path) for path in paths.values()):
-            tail = (proc.stderr or proc.stdout or "").strip()[-600:]
-            raise RuntimeError("callgraph_extract 未产出完整调用图：" + tail)
-        with open(paths["functions"], encoding="utf-8") as handle:
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout).strip()[-600:]
+            raise CallgraphError("callgraph_extract 未产出完整调用图：" + tail)
+        with open(os.path.join(out_dir, "functions.json"), encoding="utf-8") as handle:
             functions = json.load(handle)
-        with open(paths["edges"], encoding="utf-8") as handle:
+        with open(os.path.join(out_dir, "edges.json"), encoding="utf-8") as handle:
             edges = json.load(handle)
-        with open(paths["islands"], encoding="utf-8") as handle:
-            islands = json.load(handle)
-        return {"functions": functions, "edges": edges, "islands": [str(item) for item in islands]}
+        return functions, edges
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def _load_baseline() -> Optional[Set[str]]:
-    """读基线孤岛集;无基线返回 None(首次需 --refresh 建立)。"""
-    if not os.path.isfile(BASELINE_PATH):
-        return None
-    with open(BASELINE_PATH, encoding="utf-8") as handle:
-        data = json.load(handle)
-    return {str(item) for item in (data.get("islands") or [])}
+def _candidates(functions: Dict[str, Dict[str, Any]], edges: Iterable[Dict[str, Any]]) -> List[str]:
+    """非测试函数里，和其他非测试函数之间没有任何调用边（含模糊边）的函数。"""
+    non_test = {qual for qual, info in functions.items() if role_of(info["rel"]) != TEST}
+    linked: Set[str] = set()
+    for edge in edges:
+        if edge["from"] in non_test and edge["to"] in non_test:
+            linked.update((edge["from"], edge["to"]))
+    return sorted(non_test - linked)
 
 
-def _write_baseline(islands: Sequence[str], mode: str) -> None:
-    payload = {
-        "note": (
-            "死代码疑似项基线。候选来自调用图孤岛,再经过真实使用图过滤。"
-            f"本基线按 {mode} 口径生成；受控更新："
-            f"python tools/scan_dead_code_islands.py --mode {mode} --refresh。"
-        ),
-        "schema_version": 2,
-        "mode": mode,
-        "count": len(islands),
-        "islands": sorted(islands),
-    }
-    os.makedirs(os.path.dirname(BASELINE_PATH), exist_ok=True)
-    with open(BASELINE_PATH, "w", encoding="utf-8", newline="\n") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=1)
-        handle.write("\n")
+def _by_origin(items: Iterable[UsageEvidence]) -> Dict[str, List[UsageEvidence]]:
+    grouped: Dict[str, List[UsageEvidence]] = defaultdict(list)
+    for item in items:
+        grouped[item.origin].append(item)
+    return grouped
 
 
-def _analyze(mode: str, index_path: Optional[str]) -> Dict[str, object]:
-    snapshot = _compute_callgraph_snapshot()
-    functions = snapshot["functions"]  # type: ignore[assignment]
-    records = records_from_functions(functions)  # type: ignore[arg-type]
-    candidates = set(snapshot["islands"])  # type: ignore[arg-type]
-    ast_evidence = collect_ast_usage(REPO_ROOT, records)
-    scip_evidence = {}  # type: Dict[str, List[UsageEvidence]]
-    if mode == "precise":
-        scip_evidence = _collect_scip_usage(REPO_ROOT, records, index_path=index_path)
-    live = set()
-    evidence = {}  # type: Dict[str, List[UsageEvidence]]
+def scan(repo_root: str, mode: str = "quick", index_path: Optional[str] = None) -> Dict[str, Any]:
+    # 精确模式先做 SCIP 前置检查并读索引：不满足时在跑调用图之前就失败。
+    scip_docs = load_precise_index(repo_root, index_path=index_path) if mode == "precise" else None
+    functions, edges = _callgraph(repo_root)
+    records = records_from_functions(functions)
+    candidates = _candidates(functions, edges)
+    roles = CodeRoles(role_of, TEST)
+    scip_evidence = collect_scip_usage(repo_root, scip_docs, records, roles) if scip_docs is not None else {}
+    evidence = collect_ast_usage(repo_root, records, iter_role_files(repo_root, ROLES, (".py",)), roles)
+    for target, items in scip_evidence.items():
+        evidence.setdefault(target, []).extend(items)
+    entries: List[Dict[str, Any]] = []
+    live_count = 0
     for qual in candidates:
-        items = list(ast_evidence.get(qual, [])) + list(scip_evidence.get(qual, []))
-        if items:
-            live.add(qual)
-            evidence[qual] = items
-    suspect_dead = sorted(candidates - live)
+        by_origin = _by_origin(evidence.get(qual, []))
+        if set(by_origin) - {TEST}:
+            live_count += 1
+            continue
+        if by_origin:
+            refs = sorted({f"{item.source_rel}:{item.line}" for item in by_origin[TEST]})
+            entries.append({"path": qual, "kind": "test_only", "count": 1, "test_refs": refs})
+        else:
+            entries.append({"path": qual, "kind": "suspect_dead", "count": 1})
+    kind_totals = {kind: 0 for kind in KINDS}
+    for entry in entries:
+        kind_totals[entry["kind"]] += 1
     return {
+        "rule": RULE,
         "mode": mode,
+        "scan_roots": list(role_roots(ROLES)),
         "candidate_count": len(candidates),
-        "live_count": len(live),
-        "suspect_dead": suspect_dead,
-        "evidence": evidence,
+        "live_count": live_count,
+        "kind_totals": kind_totals,
+        "total": len(entries),
+        "entries": entries,
     }
 
 
-def _collect_scip_usage(repo_root, records, index_path=None):
-    from tools.dead_code_usage.scip_usage import collect_scip_usage
-
-    return collect_scip_usage(repo_root, records, index_path=index_path)
-
-
-def _print_summary(result: Dict[str, object]) -> None:
-    suspect_dead = cast(List[str], result["suspect_dead"])
-    print(
-        "[dead-code-islands] "
-        f"precision={result['mode']} candidates={result['candidate_count']} "
-        f"explained={result['live_count']} suspect_dead={len(suspect_dead)}",
-        flush=True,
-    )
+def render_text(result: Dict[str, Any]) -> str:
+    totals = result["kind_totals"]
+    lines = [
+        f"[{RULE}] mode={result['mode']} 候选 {result['candidate_count']} 个，有生产或工具引用 {result['live_count']} 个，"
+        f"疑似死代码 {totals['suspect_dead']} 个，只被测试引用 {totals['test_only']} 个"
+    ]
+    lines.extend(f"  {entry['kind']:12s} {entry['path']}" for entry in result["entries"])
     if result["mode"] == "quick":
-        print("[dead-code-islands] quick 模式未使用 SCIP;如需精确确认,运行 --mode precise。", flush=True)
+        lines.append(f"[{RULE}] quick 模式未使用 SCIP；需要精确确认时运行 --mode precise（只出报告）。")
+    return "\n".join(lines)
+
+
+def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="死代码孤岛棘轮扫描器")
+    parser.add_argument(
+        "--mode",
+        choices=("quick", "precise"),
+        default="quick",
+        help="quick=AST 使用图（门禁口径）；precise=另加新鲜 SCIP 引用，只出报告",
+    )
+    add_ratchet_arguments(parser)
+    parser.add_argument("--index-path", default=None, help=argparse.SUPPRESS)
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.mode == "precise" and (args.fail_on_new or args.refresh):
+        parser.error("precise 模式只出报告，不读写基线；比较与刷新用 --mode quick")
+    return args
+
+
+def _error(message: str) -> None:
+    print(f"[{RULE}] {message}", file=sys.stderr, flush=True)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="死代码孤岛防回潮扫描器")
-    parser.add_argument("--mode", choices=("quick", "precise"), default="quick", help="quick=AST 使用图;precise=要求新鲜 SCIP")
-    parser.add_argument("--index-path", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--warn-only", action="store_true", help="发现新增疑似死代码时只提示不阻断")
-    parser.add_argument("--refresh", action="store_true", help="把基线重写为当前疑似死代码集")
-    parser.add_argument(
-        "--quiet-when-clean",
-        action="store_true",
-        help="无新增孤岛时完全不输出（pre-push 钩子用：平时安静，有新孤岛才大声报）",
-    )
-    args = parser.parse_args(list(argv) if argv is not None else None)
-    scip_error_type = None
-    if args.mode == "precise":
-        from tools.dead_code_usage.scip_usage import ScipUsageError
-
-        scip_error_type = ScipUsageError
-
+    args = _parse_args(argv)
     try:
-        result = _analyze(args.mode, args.index_path)
-    except Exception as exc:
-        if scip_error_type is not None and isinstance(exc, scip_error_type):
-            print(f"[dead-code-islands] 精确模式不可用：{exc.message}", flush=True)
-            for hint in exc.hints:
-                print(f"  - {hint}", flush=True)
-            return 2
-        print(f"[dead-code-islands] 扫描失败：{exc}", flush=True)
+        result = scan(args.repo_root, args.mode, args.index_path)
+    except ScipUsageError as exc:
+        _error(f"精确模式不可用：{exc.message}")
+        for hint in exc.hints:
+            _error(f"  - {hint}")
         return 2
-    current = list(result["suspect_dead"])  # type: ignore[arg-type]
-
-    if args.refresh:
-        _print_summary(result)
-        _write_baseline(current, args.mode)
-        print(f"[dead-code-islands] 基线已刷新：{len(current)} 个疑似死代码 -> {BASELINE_REL}", flush=True)
-        return 0
-
-    baseline = _load_baseline()
-    if baseline is None:
-        print(
-            "[dead-code-islands] 未建立基线（先跑 `python tools/scan_dead_code_islands.py --refresh`）；本次跳过对比。",
-            flush=True,
-        )
-        return 0
-
-    current_set = set(current)
-    new_islands = sorted(current_set - baseline)
-    gone_islands = sorted(baseline - current_set)
-
-    if args.quiet_when_clean and not new_islands:
-        return 0  # 平时安静：无新增孤岛就不吭声（pre-push 钩子高频跑用）
-
-    _print_summary(result)
-
-    if new_islands:
-        print(
-            f"⚠️ [dead-code-islands] 检出 {len(new_islands)} 个新增疑似死代码：",
-            flush=True,
-        )
-        for qual in new_islands:
-            print(f"    + {qual}", flush=True)
-        print(
-            "  处理：确认是真死代码就删；若是当前设计接受的未用入口，"
-            f"跑 `python tools/scan_dead_code_islands.py --mode {args.mode} --refresh` 受控刷新基线。",
-            flush=True,
-        )
-    else:
-        print(f"[dead-code-islands] 无新增疑似死代码（基线 {len(baseline)} 个）。", flush=True)
-
-    if gone_islands:
-        print(
-            f"[dead-code-islands] {len(gone_islands)} 个基线疑似项已消失（已清理/已接线）；"
-            f"可 --mode {args.mode} --refresh 收敛基线。",
-            flush=True,
-        )
-
-    if new_islands and not args.warn_only:
-        return 1
-    return 0
+    except (CallgraphError, SyntaxError, UnicodeDecodeError) as exc:
+        _error(f"扫描失败，门禁已阻断：{exc}")
+        return 2
+    return run_ratchet_cli(
+        args,
+        rule=RULE,
+        result=result,
+        note=BASELINE_NOTE,
+        render_text=render_text,
+        error_fn=_error,
+    )
 
 
 if __name__ == "__main__":

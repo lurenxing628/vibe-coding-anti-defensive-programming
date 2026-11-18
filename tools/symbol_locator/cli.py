@@ -5,8 +5,9 @@
   python -m tools.symbol_locator callers <函数名> [--deep] [--json] [--rebuild]
   python -m tools.symbol_locator callees <函数名> [--deep] [--json] [--rebuild]
 
-产物目录由环境变量 CHECKUP_CALLGRAPH 覆盖(与 callgraph_extract 一致),
-默认 .checkup/callgraph/。
+产物目录由 static_index.callgraph_dir 解析一次:环境变量 CHECKUP_CALLGRAPH 覆盖
+(相对路径按当前工作目录解析),默认 .checkup/callgraph/;
+读取与重建使用同一个绝对路径。
 """
 from __future__ import annotations
 
@@ -14,11 +15,12 @@ import argparse
 import sys
 from typing import List, Optional, Tuple
 
+from tools.repo_paths import resolve_repo_root
+
 from . import render, static_index
 
 
-def _parse_at(value):
-    # type: (str) -> Tuple[str, int]
+def _parse_at(value: str) -> Tuple[str, int]:
     """``FILE:LINE`` -> (file, line);用 rpartition 兼容 Windows 盘符冒号。"""
     head, sep, tail = value.rpartition(":")
     if not sep or not head or not tail.isdigit() or int(tail) <= 0:
@@ -26,8 +28,7 @@ def _parse_at(value):
     return (head, int(tail))
 
 
-def build_parser():
-    # type: () -> argparse.ArgumentParser
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="symbol-locator",
         description="函数定位/影响面查询(静态图秒查 + jedi 实时消歧)")
@@ -54,47 +55,45 @@ def build_parser():
     return parser
 
 
-def _ensure_fresh(force, as_json):
-    # type: (bool, bool) -> None
+def _ensure_fresh(repo_root: str, graph_dir: str, force: bool, as_json: bool) -> bool:
     from . import freshness
-    if force or freshness.is_stale():
+    if force or freshness.is_stale(repo_root, graph_dir):
         reason = "强制 --rebuild" if force else "源码已变,快照过期"
         sys.stderr.write(f"[symbol-locator] {reason},重建静态图(~2s)...\n")
-        if not freshness.rebuild():
-            sys.stderr.write("[symbol-locator] 重建失败,沿用旧快照\n")
-            hint = freshness.rebuild_error_hint()
-            if hint:
-                sys.stderr.write(f"[symbol-locator] {hint}\n")
+        error = freshness.rebuild(repo_root, graph_dir)
+        if error is not None:
+            sys.stderr.write(f"[symbol-locator] {freshness.rebuild_error_hint(error)}\n")
+            return False
     if not as_json:
-        sys.stderr.write(f"[快照 {freshness.snapshot_label()}]\n")
+        sys.stderr.write(f"[快照 {freshness.snapshot_label(graph_dir)}]\n")
+    return True
 
 
-def main(argv=None):
-    # type: (Optional[List[str]]) -> int
+def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
-    try:
-        args = parser.parse_args(argv)
-    except SystemExit as exc:
-        return int(exc.code or 0)
+    args = parser.parse_args(argv)
     if not args.cmd:
         parser.print_help()
         return 2
+    repo_root = resolve_repo_root()
     if args.cmd == "build-index":
-        return _build_scip_index(args.output, args.json)
-    _ensure_fresh(args.rebuild, args.json)
-    index = static_index.load()
+        return _build_scip_index(repo_root, args.output, args.json)
+    graph_dir = static_index.callgraph_dir(repo_root)
+    if not _ensure_fresh(repo_root, graph_dir, args.rebuild, args.json):
+        return 2
+    index = static_index.load(graph_dir)
     if args.cmd == "whereis":
-        return render.render_whereis(args.symbol, index, as_json=args.json, at=args.at)
-    return render.render_relation(args.symbol, index, args.cmd, as_json=args.json, deep=args.deep)
+        return render.render_whereis(args.symbol, index, repo_root, as_json=args.json, at=args.at)
+    return render.render_relation(args.symbol, index, args.cmd, repo_root, as_json=args.json, deep=args.deep)
 
 
-def _build_scip_index(output, as_json):
-    # type: (Optional[str], bool) -> int
+def _build_scip_index(repo_root: str, output: Optional[str], as_json: bool) -> int:
     import json
 
     from . import scip_deep
+    index_path = scip_deep.default_index_path(repo_root) if output is None else output
     try:
-        path = scip_deep.build_index(index_path=output, stdout=sys.stderr if as_json else None)
+        path = scip_deep.build_index(repo_root, index_path, stdout=sys.stderr if as_json else None)
     except scip_deep.ScipUnavailable as exc:
         if as_json:
             print(json.dumps({"engine": "scip", "error": exc.code, "message": exc.message, "hints": exc.hints},

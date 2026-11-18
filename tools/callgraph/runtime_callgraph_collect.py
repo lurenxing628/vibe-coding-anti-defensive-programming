@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""运行时调用边采集器（动态交叉验证 · sys.setprofile 录像）。
+"""运行时调用边采集器（动态交叉验证·setprofile 录像）。
 
-用 sys.setprofile / threading.setprofile 在测试运行时录下真实发生过的 caller -> callee 边，
-按静态图同款全限定名 (rel::Class.method) 消解，只保留第一方函数之间的边。
-产物交给 callgraph_extract.py (--mode deep) 或 callgraph_crossval.py 对账：
-  - 静态标“模糊（ambiguous）”的边里，运行时真跑到的直接升级为确信实线并剪除同调用点假候选；
-  - 运行时有而静态完全没有的边，即为静态分析漏掉的动态派发（getattr / 回调 / 鸭子类型等）。
+用 sys.setprofile 在测试运行时录下真实发生过的 caller->callee 边，按静态图同款全限定名
+(rel::Class.method) 消解，只保留第一方函数之间的边。产物交给 callgraph_extract.py (--mode deep)
+或 callgraph_crossval.py 对账：静态标"模糊"的边里运行时真跑到的直接转实线并剪除同调用点假候选；
+运行时有而静态完全没有的是静态漏掉的动态派发。
 
-只读不改业务代码。用法:
-    python3 tools/callgraph/runtime_callgraph_collect.py [pytest_args...]
+只读不改业务代码。setprofile 仅在分析期开启、不进交付包。Py3.8 兼容、纯标准库 + pytest。
+
+用法:
+    .venv/bin/python tools/callgraph/runtime_callgraph_collect.py tests
 环境变量:
     CHECKUP_CALLGRAPH          静态图产物目录（可选；未设置时直接实时索引当前源码）
     CHECKUP_CALLGRAPH_RUNTIME  运行时产物目录（默认 .checkup/callgraph_runtime）
@@ -106,6 +107,7 @@ def _resolve(code: CodeType, index: NameIndex, spans: SpanIndex) -> Optional[str
         if len(contained) == 1:
             return contained[0]
         return min(candidates, key=lambda item: abs(item[1] - line))[0]
+    # 对 lambda / 推导式 / 动态装饰器栈帧按最小包含行号区间定位所属函数
     file_spans = spans.get(rel)
     if file_spans:
         enclosing = [(hi - lo, qual) for lo, hi, qual in file_spans if lo <= line <= hi]

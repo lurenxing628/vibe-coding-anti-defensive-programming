@@ -1,93 +1,41 @@
-"""AST 使用图的内部节点工具。"""
+"""AST 使用图的节点小工具：Python 3.8 下标包装、节点跨度、常量下标、lambda 记录名。"""
 from __future__ import annotations
 
 import ast
-from collections import defaultdict
-from typing import Dict, Optional, Set, Tuple
+from typing import Optional, Tuple
 
-from .model import FunctionRecord
-
-
-class FunctionNode:
-    def __init__(self, record, node):
-        # type: (FunctionRecord, ast.AST) -> None
-        self.record = record
-        self.node = node
-        self.params = param_names(node)
+FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
+COMPREHENSION_NODES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+LOCATED = (ast.expr, ast.stmt, ast.excepthandler, ast.arg)
 
 
-class ModuleInfo:
-    def __init__(self, rel, module, tree):
-        # type: (str, str, ast.Module) -> None
-        self.rel = rel
-        self.module = module
-        self.tree = tree
-        self.module_aliases = {}  # type: Dict[str, str]
-        self.direct_aliases = {}  # type: Dict[str, str]
-        self.class_aliases = {}  # type: Dict[str, str]
-        self.non_class_names = set()  # type: Set[str]
+def subscript_index(node: ast.Subscript) -> ast.AST:
+    """下标表达式本体：Python 3.8 把它包在 ``ast.Index`` 里，3.9 起直接是表达式。
+
+    typeshed 已不为 ``ast.Index`` 声明 ``value``，这里与调用图提取器一样按 3.8 的真实结构读取。
+    """
+    sliced = node.slice
+    return sliced.value if isinstance(sliced, ast.Index) else sliced  # type: ignore[attr-defined]
 
 
-def functions_by_rel(functions):
-    grouped = defaultdict(list)
-    for item in functions.values():
-        grouped[item.record.rel].append(item)
-    for rel in grouped:
-        grouped[rel].sort(key=lambda item: (item.record.line, item.record.end))
-    return grouped
+def node_span(node: ast.AST) -> Tuple[int, int, int, int]:
+    """节点在源码里的完整跨度 (起始行, 起始列, 结束行, 结束列)：起点相同的嵌套节点（``a + b == c`` 里的
+    ``a + b`` 与整个比较）靠结束位置区分。"""
+    assert isinstance(node, LOCATED)
+    assert node.end_lineno is not None and node.end_col_offset is not None
+    return node.lineno, node.col_offset, node.end_lineno, node.end_col_offset
 
 
-def function_node_lookup(tree):
-    # type: (ast.Module) -> Dict[Tuple[int, str, Optional[str]], ast.AST]
-    result = {}
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            result[(line(node), node.name, None)] = node
-        elif isinstance(node, ast.ClassDef):
-            for sub in node.body:
-                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    result[(line(sub), sub.name, node.name)] = sub
-    return result
+def constant_int(node: ast.AST) -> Optional[int]:
+    """整数字面量（含负号）的值；其他表达式返回 None。"""
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        inner = constant_int(node.operand)
+        return None if inner is None else -inner
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    return None
 
 
-def class_id(rel, cls):
-    # type: (str, str) -> str
-    return f"{rel}::{cls}"
-
-
-def param_names(node):
-    args = getattr(node, "args", None)
-    if args is None:
-        return []
-    params = []
-    for arg in list(getattr(args, "posonlyargs", [])) + list(args.args) + list(args.kwonlyargs):
-        params.append(arg.arg)
-    if getattr(args, "vararg", None):
-        params.append(args.vararg.arg)
-    if getattr(args, "kwarg", None):
-        params.append(args.kwarg.arg)
-    return params
-
-
-def line(node):
-    return int(getattr(node, "lineno", 0) or 0)
-
-
-def position(node):
-    return (line(node), int(getattr(node, "col_offset", 0) or 0))
-
-
-def end_position(node):
-    start_line, start_col = position(node)
-    return (
-        int(getattr(node, "end_lineno", start_line) or start_line),
-        int(getattr(node, "end_col_offset", start_col) or start_col),
-    )
-
-
-def before_position(node, before):
-    if before is None:
-        return True
-    if not isinstance(before, tuple):
-        before = (int(before), 0)
-    return end_position(node) <= before
+def lambda_label(node: ast.Lambda) -> str:
+    """与调用图提取器一致的 lambda 记录名。"""
+    return f"<lambda>@{node.lineno}:{node.col_offset}"

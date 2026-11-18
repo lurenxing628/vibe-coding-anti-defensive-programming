@@ -11,6 +11,7 @@ It attaches `codex resume <thread> --no-alt-screen` to the shared app-server dae
 the followed lane switches threads (or another lane starts a turn), restarts the TUI on the
 new one. Ctrl-C quits.
 """
+import os
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,16 @@ from pathlib import Path
 CODEX = shutil.which("codex") or os.path.expanduser("~/.local/bin/codex")
 BASE = Path.home() / ".cache" / "agy-dual-model-pipeline" / "codex"  # see codex_drive.py
 SESSIONS = Path.home() / ".codex" / "sessions"
+STRIP_ENV_KEYS = ("NO_COLOR", "CODEX_CI", "CODEX_SHELL")
+
+
+def tui_env():
+    env = {k: v for k, v in os.environ.items() if k not in STRIP_ENV_KEYS}
+    if not env.get("TERM") or env["TERM"] == "dumb":
+        env["TERM"] = "xterm-256color"
+    if not env.get("COLORTERM"):
+        env["COLORTERM"] = "truecolor"
+    return env
 
 
 def persisted(thread):
@@ -55,7 +66,10 @@ def main():
                     print("\n===== Codex 车道 {} 会话 {} =====".format(lane, thread), flush=True)
                     # Inline mode keeps the transcript in the terminal's own
                     # scrollback, so it can be scrolled back across turns and threads.
-                    child = subprocess.Popen([CODEX, "resume", thread, "--remote", "unix://", "--no-alt-screen"])
+                    child = subprocess.Popen(
+                        [CODEX, "resume", thread, "--remote", "unix://", "--no-alt-screen"],
+                        env=tui_env(),
+                    )
                 else:
                     child = None
                     print("\n当前 Codex 会话已结束，等待主代理开启新会话……")

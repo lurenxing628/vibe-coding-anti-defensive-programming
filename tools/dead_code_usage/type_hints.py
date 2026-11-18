@@ -1,64 +1,97 @@
-"""AST 使用图的类型注解读取。"""
+"""类型注解 → 抽象值：仓库类给实例，仓库外的类给 ``ExternalInst``，typing 的容器、元组、Optional/Union、Type、
+Callable 给对应结构。
+
+注解里的名字按静态符号解析（模块级绑定与内置名），所以前向引用与 ``from __future__ import annotations``
+都按最终定义取值。Python 3.8 的下标表达式包在 ``ast.Index`` 里，由 ``subscript_index`` 统一拆开。
+"""
 from __future__ import annotations
 
 import ast
-import re
-from collections import defaultdict
+from typing import TYPE_CHECKING, List, Optional
 
-_RETURN_COMMENT = re.compile(r"->\s*([A-Za-z_][A-Za-z0-9_.]*)")
+from .ast_nodes import subscript_index
+from .imports import CLASS, EXTERNAL
+from .scope import Scope
+from .values import EMPTY, CallableT, ClassObj, Inst, MapT, SeqT, Tup, Values, external_instance, join
 
+if TYPE_CHECKING:
+    from .imports import ModuleInfo
+    from .program import Program
 
-def function_return_types(context, class_id_for_name):
-    result = {}
-    for qual, item in context["functions"].items():
-        result[qual] = _return_type(context, item.record.rel, item.node, class_id_for_name)
-    return result
-
-
-def _return_type(context, rel, node, class_id_for_name):
-    annotation = getattr(node, "returns", None)
-    name = annotation_name(annotation)
-    if name:
-        return class_id_for_name(context, name, rel)
-    type_comment = getattr(node, "type_comment", None)
-    if type_comment:
-        matched = _RETURN_COMMENT.search(type_comment)
-        if matched:
-            return class_id_for_name(context, matched.group(1).split(".")[-1], rel)
-    return None
+_TYPING_MODULES = ("typing.", "typing_extensions.", "collections.abc.", "collections.", "builtins.", "dataclasses.")
+_SEQUENCES = frozenset({
+    "List", "list", "Sequence", "MutableSequence", "Iterable", "Iterator", "Collection", "Set", "set", "FrozenSet",
+    "frozenset", "AbstractSet", "MutableSet", "Deque", "deque", "Generator", "AsyncIterator", "AsyncIterable",
+    "AsyncGenerator", "Reversible", "KeysView", "ValuesView",
+})
+_MAPPINGS = frozenset({"Dict", "dict", "Mapping", "MutableMapping", "DefaultDict", "defaultdict", "OrderedDict", "ChainMap"})
+_FIRST_ARGUMENT = frozenset({"Optional", "ClassVar", "Final", "Annotated", "InitVar"})
 
 
-def annotation_name(node):
+def annotation_values(program: Program, scope: Scope, module: ModuleInfo, node: Optional[ast.AST]) -> Values:
     if node is None:
-        return None
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return node.attr
+        return EMPTY
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value.strip("'\"").split(".")[-1]
+        return annotation_values(program, scope, module, ast.parse(node.value.strip(), mode="eval").body)
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        return join(*(_class_instances(program, symbol) for symbol in program.static_expr(scope, module, node)))
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return join(annotation_values(program, scope, module, node.left), annotation_values(program, scope, module, node.right))
     if isinstance(node, ast.Subscript):
-        base = node.value
-        base_name = getattr(base, "id", None) or getattr(base, "attr", None)
-        if base_name == "Optional":
-            sliced = node.slice
-            inner = getattr(sliced, "value", sliced)
-            return annotation_name(inner)
+        return _subscript_values(program, scope, module, node)
+    return EMPTY
+
+
+def type_comment_values(program: Program, scope: Scope, module: ModuleInfo, comment: str) -> Values:
+    return annotation_values(program, scope, module, ast.parse(comment, mode="eval").body)
+
+
+def function_type_comment(comment: str) -> ast.FunctionType:
+    tree = ast.parse(comment, mode="func_type")
+    assert isinstance(tree, ast.FunctionType)
+    return tree
+
+
+def _class_instances(program: Program, symbol) -> Values:
+    if symbol.kind == CLASS:
+        cls = program.class_by_node.get(id(symbol.node))
+        return frozenset({Inst(cls.cid)}) if cls is not None else EMPTY
+    if symbol.kind == EXTERNAL:
+        return external_instance(program.index.externals, symbol.module)
+    return EMPTY
+
+
+def _generic_kind(program: Program, scope: Scope, module: ModuleInfo, head: ast.AST) -> Optional[str]:
+    for symbol in program.static_expr(scope, module, head):
+        if symbol.kind == EXTERNAL and symbol.module.startswith(_TYPING_MODULES):
+            return symbol.module.rpartition(".")[2]
     return None
 
 
-def initial_param_types(context, class_id, class_id_for_name):
-    param_types = defaultdict(lambda: defaultdict(set))
-    for qual, item in context["functions"].items():
-        record = item.record
-        if record.cls and item.params:
-            param_types[qual][item.params[0]].add(class_id(record.rel, record.cls))
-        args = getattr(item.node, "args", None)
-        if args is None:
-            continue
-        for arg in list(getattr(args, "posonlyargs", [])) + list(args.args) + list(args.kwonlyargs):
-            name = annotation_name(arg.annotation)
-            resolved = class_id_for_name(context, name, record.rel)
-            if resolved:
-                param_types[qual][arg.arg].add(resolved)
-    return param_types
+def _subscript_values(program: Program, scope: Scope, module: ModuleInfo, node: ast.Subscript) -> Values:
+    inner = subscript_index(node)
+    args: List[ast.AST] = list(inner.elts) if isinstance(inner, ast.Tuple) else [inner]
+    kind = _generic_kind(program, scope, module, node.value)
+    if kind is None:
+        return annotation_values(program, scope, module, node.value)
+
+    def values(arg: ast.AST) -> Values:
+        return annotation_values(program, scope, module, arg)
+
+    if kind in _FIRST_ARGUMENT:
+        return values(args[0])
+    if kind == "Union":
+        return join(*(values(arg) for arg in args))
+    if kind in ("Tuple", "tuple"):
+        if len(args) == 2 and isinstance(args[1], ast.Constant) and args[1].value is Ellipsis:
+            return frozenset({SeqT(values(args[0]))})
+        return frozenset({Tup(tuple(values(arg) for arg in args))})
+    if kind in _SEQUENCES:
+        return frozenset({SeqT(values(args[0]))})
+    if kind in _MAPPINGS and len(args) == 2:
+        return frozenset({MapT(values(args[0]), values(args[1]))})
+    if kind in ("Type", "type"):
+        return frozenset(ClassObj(value.cls) for value in values(args[0]) if isinstance(value, Inst))
+    if kind == "Callable" and len(args) == 2:
+        return frozenset({CallableT(values(args[1]))})
+    return EMPTY
